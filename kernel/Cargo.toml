@@ -2,28 +2,80 @@
 name = "nonos_kernel"
 version = "0.1.0"
 edition = "2021"
+authors = ["core.dev@nonos.tech"]
+description = "NØNOS: RAM-resident, cryptographically authenticated, modular microkernel"
+license = "AGPL-3.0"
+repository = "https://github.com/NON-OS/N0N-OS"
+readme = "README.md"
+build = "build.rs"
+publish = false
+categories = ["no-std", "os::bare-metal", "cryptography", "security"]
+keywords = ["kernel", "os", "zero-trust", "microkernel", "rust"]
+resolver = "2"
+rust-version = "1.78"
+
+[workspace]
+members = [ "." ]
 
 [dependencies]
-x86_64       = "0.15"
-spin         = "0.9"
-lazy_static  = "1.4"
-uart_16550   = "0.2"
-volatile     = "0.4"
-log          = "0.4"
-linked_list_allocator = "0.9"
-hashbrown    = "0.14"  # Optional: HashMap without stdlib
-shared       = { path = "../shared", default-features = false }
+# Core execution & hardware
+x86_64                = { version = "0.15", default-features = false }
+spin                  = "0.9"
+lazy_static           = { version = "1.4", features = ["spin_no_std"] }
+volatile              = "0.4"
+linked_list_allocator = "0.10"
+hashbrown             = { version = "0.14", features = ["nightly"] }
 
+# Debug/log output
+uart_16550            = "0.2"
+log                   = "0.4"
+rlibc                 = "1.0.0"
+
+# Crypto stack (optional, vault layer)
+zeroize               = { version = "1.6", optional = true, default-features = false }
+ring                  = { version = "0.17", optional = true, default-features = false }
+hkdf                  = { version = "0.12", optional = true }
+
+# Optional: UEFI support
+uefi                  = { version = "0.21", optional = true }
+uefi-services         = { version = "0.18", optional = true }
+
+# Internal shared crate
+shared                = { path = "../shared", optional = true }
+
+# Feature sets for modular builds
+[features]
+default        = []
+debug-serial   = []
+uefi-boot      = ["uefi", "uefi-services"]
+crypto-vault   = ["zeroize", "ring", "hkdf"]
+shared         = ["shared"]
+full           = ["uefi-boot", "crypto-vault", "shared"]
+
+# Build-time
 [build-dependencies]
-bootloader = { version = "0.10", default-features = false } # optional if you're still using for tooling
+bootloader = { version = "0.10", default-features = false }
 
+# Lints & policy enforcement
+[package.metadata]
+# Enforce internal policies (used by CI or tooling)
+enforce = { deny-warnings = true, rustflags = ["-D warnings", "-D missing-docs", "-D missing-debug-implementations"] }
+
+# Profiles (optimized kernel, fast dev loop)
 [profile.dev]
 panic = "abort"
+opt-level = 1
 lto = false
+debug = true
 codegen-units = 1
+overflow-checks = true
 
 [profile.release]
 panic = "abort"
+opt-level = "z"
 lto = true
 strip = "symbols"
+debug = false
 codegen-units = 1
+overflow-checks = false
+incremental = false
