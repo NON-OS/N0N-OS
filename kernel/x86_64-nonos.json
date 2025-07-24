@@ -2,10 +2,26 @@
   "llvm-target": "x86_64-unknown-none",
   "data-layout": "e-m:e-i64:64-f80:128-n8:16:32:64-S128",
   "arch": "x86_64",
+  "vendor": "nonos",
   "os": "none",
-  "executables": true,
-"linker-flavor": "ld.lld",
+  "cpu": "x86-64",
+  "features": "+sse2,+fxsr,+xsave,+xsaveopt,+xsavec,+xgetbv1,+rdtscp,+clflushopt,+pku,+soft-float",
   "panic-strategy": "abort",
+  "executables": true,
+  "linker-flavor": "ld.lld",
+  "linker": "rust-lld",
+  "relocation-model": "static",
+  "code-model": "kernel",
   "disable-redzone": true,
-  "relocation-model": "static"
+  "eliminate-frame-pointer": false,
+  "default-hidden-visibility": true,
+  "tls-model": "local-exec",
+  "pre-link-args": {
+    "ld.lld": [
+      "--build-id=none",
+      "-Ttext=0x100000",
+      "--no-rosegment",
+      "--nmagic"
+    ]
+  }
 }
