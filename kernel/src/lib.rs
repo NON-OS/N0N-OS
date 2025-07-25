@@ -1,10 +1,11 @@
-//! NØNOS Secure Kernel Initialization (lib.rs)
+//! NØNOS Kernel Entrypoint — Secure ZeroState Runtime
 //!
-//! This is the privileged execution root of the NØNOS microkernel.
-//! It establishes the ZeroState execution context, secure memory setup,
-//! cryptographic root-of-trust via Vault, module manifest system, and
-//! async-capable scheduling loop. All runtime state remains RAM-resident,
-//! governed by a capability-authenticated syscall interface.
+//! This is the foundational entrypoint of the NØNOS operating system. It performs:
+//! - Secure boot initialization (GDT, IDT, paging, heap)
+//! - Root-of-trust provisioning via cryptographic vault
+//! - Ephemeral ZeroState activation (RAM-only runtime)
+//! - Modular sandbox subsystem and verified `.mod` loader
+//! - Async-capable scheduler loop with syscalls and capability tokens
 
 #![no_std]
 #![no_main]
@@ -12,15 +13,7 @@
 
 extern crate alloc;
 
-use core::panic::PanicInfo;
-use crate::runtime::zerostate::init_zerostate;
-use crate::modules::mod_loader::{init_module_loader, load_core_module};
-use crate::sched::executor::run_scheduler;
-use crate::log::logger::init_logger;
-use crate::crypto::vault::{init_vault, is_vault_ready};
-use crate::arch::x86_64::{gdt, idt, vga};
-use crate::memory::frame_alloc::init as init_frame_alloc;
-
+// Subsystem modules
 pub mod arch;
 pub mod crypto;
 pub mod ipc;
@@ -31,66 +24,73 @@ pub mod runtime;
 pub mod sched;
 pub mod syscall;
 
-/// Kernel entry function — bootloader invokes with full control at _start.
-/// Performs layered subsystem initialization with explicit root-of-trust enforcement.
+// Imports
+use core::panic::PanicInfo;
+use arch::x86_64::{gdt, idt, vga};
+use crypto::init_crypto;
+use log::logger::init_logger;
+use memory::{frame_alloc, heap};
+use modules::mod_loader::{init_module_loader, load_core_module, ModuleLoadResult};
+use runtime::zerostate::init_zerostate;
+use sched::executor::run_scheduler;
+
+/// Root kernel entry — executed by bootloader.
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // Stage 0: Logger (for VGA or serial-based diagnostics)
     init_logger();
-    log("[BOOT] NØNOS kernel entrypoint reached");
+    log("\n[BOOT] NØNOS kernel starting...");
 
-    // Stage 1: CPU privilege descriptors and traps
+    // 1. Architecture bootstrap
     gdt::init();
     idt::init();
-    log("[INIT] Arch subsystem: GDT/IDT initialized");
+    log("[INIT] GDT/IDT initialized");
 
-    // Stage 2: RAM frame allocator + memory subsystem
-    init_frame_alloc();
-    log("[MEM] Physical memory allocator initialized");
+    // 2. Memory and allocator
+    frame_alloc::init();
+    heap::init_kernel_heap();
+    log("[MEM] Heap and frame allocator initialized");
 
-    // Stage 3: Crypto vault: device-sealed key provisioning
-    init_vault();
-    assert!(is_vault_ready(), "Vault initialization failed: root-of-trust unavailable");
-    log("[SECURE] Vault integrity: OK");
+    // 3. Cryptographic root-of-trust
+    init_crypto();
+    assert!(crypto::crypto_ready(), "[SECURE] Vault failed to initialize");
+    log("[SECURE] Cryptographic vault ready");
 
-    // Stage 4: ZeroState ephemeral boot environment
+    // 4. ZeroState RAM runtime
     init_zerostate();
-    log("[RUNTIME] RAM-resident ZeroState active");
+    log("[RUNTIME] ZeroState execution environment live");
 
-    // Stage 5: Modular loader (sandboxed `.mod` apps with capability auth)
+    // 5. Module loader and secure manifest system
     init_module_loader();
-    let core_token = load_core_module("core.console");
-    match core_token {
-        crate::modules::mod_loader::ModuleLoadResult::Accepted(_) =>
-            log("[MOD] core.console module registered"),
-        _ => log("[MOD] core.console module failed to load")
+    match load_core_module("core.boot") {
+        ModuleLoadResult::Accepted(_) => log("[MOD] core.boot module registered"),
+        ModuleLoadResult::Rejected(e) => log(&format!("[MOD] core.boot rejected: {}", e))
     }
 
-    // Stage 6: Secure scheduler and async dispatcher
-    log("[SCHED] Launching task executor");
+    // 6. Async task scheduler
+    log("[SCHED] Executor loop initialized");
     run_scheduler();
 }
 
-/// Universal panic trap
+/// Trap any kernel panic and log failure reason.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    vga::print("\n\n💥 [KERNEL PANIC]\n");
+    vga::print("\n💥 [PANIC]\n");
     if let Some(msg) = info.message() {
-        vga::print(&format!("reason: {}\n", msg));
+        vga::print(&format!("{}\n", msg));
     } else {
-        vga::print("reason: unknown\n");
+        vga::print("unknown panic\n");
     }
     loop {}
 }
 
-/// Kernel memory allocation failure trap
+/// Trap allocator failures
 #[alloc_error_handler]
 fn alloc_error(layout: core::alloc::Layout) -> ! {
-    vga::print(&format!("\n❗ [ALLOC ERROR] layout = {:?}\n", layout));
+    vga::print(&format!("\n❗ ALLOC ERROR: {:?}\n", layout));
     panic!("heap exhausted")
 }
 
-/// Internal logger macro for VGA/debug UART output
+/// Lightweight early-stage logger
 fn log(msg: &str) {
     vga::print(&format!("{}\n", msg));
 }
