@@ -432,10 +432,10 @@ cargo clippy
 
 ## 🌟 Community
 
-- 💬 [Discord Server](https://discord.gg/nonos)
-- 🐦 [Twitter](https://twitter.com/nonos_os)
-- 📧 [Mailing List](mailto:dev@nonos.tech)
-- 🌐 [Website](https://nonos.tech)
+- 💬 [Telegram](https://t.me/nonosPortal)
+- 🐦 [Twitter](https://twitter.com/nonos_eth)
+- 📧 [Mailing List](mailto:team@nonos.site)
+- 🌐 [Website](https://nonos-tech.xyz)
 
 ---
 
