@@ -145,7 +145,7 @@ N0N-OS/
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Quick Start (SOON) TBA
 
 ### Prerequisites
 
@@ -168,7 +168,7 @@ brew install qemu
 sudo pacman -S qemu
 ```
 
-### Build & Run
+### Build & Run (SOON) TBA
 
 ```bash
 # Clone the repository
