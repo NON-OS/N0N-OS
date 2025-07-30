@@ -1,80 +1,107 @@
-//! NØNOS Module Capability Authentication Layer
+//! NØNOS Module Admission Authority
 //!
-//! This subsystem authenticates and issues runtime `CapabilityToken`s,
-//! attaches cryptographic attestations, and ensures only verified modules
-//! receive scoped permissions based on signed or ZK-authenticated manifest contracts.
+//! Verifies `.mod` manifests using a decentralized trust policy.
+//! This integrates zk-proof of signer identity, root key rotation,
+//! DAO-curated signer registry, and fine-grained capability scoping.
 
-use crate::capabilities::{Capability, CapabilityToken};
+use crate::crypto::vault::{verify_signature, get_root_pubkeys, verify_zk_attestation};
 use crate::modules::manifest::ModuleManifest;
-use crate::crypto::vault::{sign_token, VaultPublicKey};
-use crate::crypto::zk::{hash_capabilities, verify_attestation};
+use crate::capabilities::{CapabilityToken, Capability};
+use crate::log::logger::{log_info, log_warn};
+
 use alloc::vec::Vec;
+use alloc::collections::BTreeSet;
 
-/// Issued capability attestation that proves origin, scope, and constraints.
-#[derive(Debug, Clone)]
-pub struct CapabilityAttestation {
-    pub token: CapabilityToken,
-    pub scope_fingerprint: [u8; 32],
-    pub build_commitment: [u8; 32],
-    pub signed_proof: [u8; 64],
+/// Result of decentralized manifest verification
+pub enum AuthResult {
+    Verified(CapabilityToken),
+    Rejected(&'static str),
 }
 
-/// Capability issuance failure types
-#[derive(Debug)]
-pub enum CapabilityIssueError {
-    PolicyViolation(&'static str),
-    AttestationFailure,
-    InvalidSignature,
-}
+/// DAO-governed trusted signer registry (RAM-loaded)
+static mut TRUSTED_SIGNERS: Option<BTreeSet<[u8; 32]>> = None;
 
-/// Enforce security model: restrict dangerous capability overlaps, enforce size limits
-fn validate_policy(requested: &[Capability]) -> Result<(), CapabilityIssueError> {
-    if requested.is_empty() {
-        return Err(CapabilityIssueError::PolicyViolation("Empty capability set"));
+/// Load the trusted root registry from vault
+pub fn init_trusted_signers() {
+    let keys = get_root_pubkeys();
+    unsafe {
+        TRUSTED_SIGNERS = Some(BTreeSet::from_iter(keys));
     }
-    if requested.contains(&Capability::CoreExec) && requested.contains(&Capability::Net) {
-        return Err(CapabilityIssueError::PolicyViolation("CoreExec + Net requires isolated runtime"));
-    }
-    Ok(())
+    log_info("auth", "Trusted signer root initialized");
 }
 
-/// Issue a scoped token based on a trusted manifest
-pub fn issue_token(manifest: &ModuleManifest) -> Result<CapabilityToken, CapabilityIssueError> {
-    validate_policy(manifest.required_caps)?;
+/// Add a DAO-approved signer (zk-proven identity)
+pub fn approve_signer(pubkey: [u8; 32]) {
+    unsafe {
+        if let Some(registry) = TRUSTED_SIGNERS.as_mut() {
+            registry.insert(pubkey);
+        }
+    }
+    log_info("auth", &format!("Signer approved: {:x?}", &pubkey[..4]));
+}
 
-    Ok(CapabilityToken {
+/// Core manifest authentication and scope filtering
+pub fn authenticate_manifest(manifest: &ModuleManifest) -> AuthResult {
+    let sig = manifest.signature.ok_or("Missing signature").unwrap();
+    let zk = manifest.zk_proof;
+
+    // Derive attested identity from zk proof
+    let signer_id = match zk {
+        Some(proof) => {
+            match verify_zk_attestation(proof) {
+                Some(id) => id,
+                None => return AuthResult::Rejected("zkProof identity invalid"),
+            }
+        }
+        None => manifest.signer_id,
+    };
+
+    if signer_id.is_none() {
+        return AuthResult::Rejected("No valid signer identity");
+    }
+
+    let signer_key = signer_id.unwrap();
+
+    // Validate against DAO signer registry
+    let trusted = unsafe {
+        TRUSTED_SIGNERS
+            .as_ref()
+            .map(|set| set.contains(&signer_key))
+            .unwrap_or(false)
+    };
+
+    if !trusted {
+        return AuthResult::Rejected("Signer not in trusted DAO registry");
+    }
+
+    if !verify_signature(manifest.hash, sig, &signer_key) {
+        return AuthResult::Rejected("Signature mismatch");
+    }
+
+    // Issue scoped capabilities (future: filter by role or NFT)
+    let token = CapabilityToken {
         owner_module: manifest.name,
         permissions: manifest.required_caps,
-    })
+    };
+
+    log_info("auth", &format!(
+        "Authenticated module '{}' by {:x?}, caps = {}",
+        manifest.name, &signer_key[..4], token.permissions.len()
+    ));
+
+    AuthResult::Verified(token)
 }
 
-/// Issue a signed attestation alongside the scoped token
-pub fn issue_attested_token(manifest: &ModuleManifest) -> Result<CapabilityAttestation, CapabilityIssueError> {
-    let token = issue_token(manifest)?;
-
-    let scope_hash = hash_capabilities(token.permissions);
-    let build_hash = manifest.build_id;
-
-    let mut joined = [0u8; 64];
-    joined[..32].copy_from_slice(&scope_hash);
-    joined[32..].copy_from_slice(&build_hash);
-
-    let sig = sign_token(&joined)
-        .map_err(|_| CapabilityIssueError::InvalidSignature)?;
-
-    Ok(CapabilityAttestation {
-        token,
-        scope_fingerprint: scope_hash,
-        build_commitment: build_hash,
-        signed_proof: sig,
-    })
-}
-
-/// Validate attestation from remote module or registry
-pub fn verify_attested_token(attest: &CapabilityAttestation, pubkey: &VaultPublicKey) -> bool {
-    let mut joined = [0u8; 64];
-    joined[..32].copy_from_slice(&attest.scope_fingerprint);
-    joined[32..].copy_from_slice(&attest.build_commitment);
-
-    verify_attestation(&joined, &attest.signed_proof, pubkey)
+/// DAO-unsafe fallback (for local devnet only)
+pub fn unsafe_allow_all_caps(name: &'static str) -> CapabilityToken {
+    CapabilityToken {
+        owner_module: name,
+        permissions: &[
+            Capability::CoreExec,
+            Capability::IO,
+            Capability::IPC,
+            Capability::Crypto,
+            Capability::Storage,
+        ],
+    }
 }
