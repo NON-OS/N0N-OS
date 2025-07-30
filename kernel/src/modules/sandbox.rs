@@ -1,58 +1,106 @@
-//! NØNOS Sandbox Context
+//! NØNOS Sandbox Execution Context &Hardened 
+//! core@dev|nonos
+//! This is the isolated execution perimeter for any `.mod` binary. It enforces:
+//! - Cryptographic execution identity (`exec_id`)
+//! - Dynamic fault policy enforcement
+//! - Runtime-bound memory fencing
+//! - Capability-authenticated syscall perimeter
+//! - Snapshot attestation export
 //!
-//! Provides per-module memory + capability + runtime isolation.
-//! This is the foundation of zero-trust execution within NØNOS.
+//! Every capsule is instantiated through this zero-trust boundary.
 
-use crate::memory::region::{MemoryRegion, allocate_region};
 use crate::capabilities::{CapabilityToken};
+use crate::crypto::zk::{AttestationProof, derive_exec_id, generate_snapshot_signature};
+use crate::memory::region::{MemoryRegion, allocate_region};
+use crate::modules::manifest::ModuleManifest;
 use crate::modules::runtime::{RuntimeCapsule, FaultPolicy};
-use crate::log::logger::log_info;
+use crate::log::logger::{log_info, log_warn};
 
-use alloc::string::String;
-
-/// Executable module sandbox — the execution perimeter of a `.mod` binary
+/// Core sandbox state encapsulation for a `.mod` capsule
 pub struct SandboxContext {
     pub name: &'static str,
+    pub exec_id: [u8; 32],
     pub memory: MemoryRegion,
     pub token: CapabilityToken,
     pub runtime: RuntimeCapsule,
 }
 
 impl SandboxContext {
-    /// Create a new sandbox for an accepted module manifest
-    pub fn new(name: &'static str, mem: MemoryRegion, token: &CapabilityToken) -> Result<Self, &'static str> {
-        log_info("sandbox", &format!("Creating sandbox context for module '{}'", name));
+    /// Construct a fully isolated sandbox from a manifest
+    pub fn new(manifest: &'static ModuleManifest, token: &CapabilityToken) -> Result<Self, &'static str> {
+        if !manifest.is_valid() {
+            return Err("Manifest integrity or policy check failed");
+        }
 
-        // Assign default fault policy — can be replaced by manifest later
-        let policy = FaultPolicy::Restart;
+        let mem = allocate_region(manifest.memory_required as usize)
+            .ok_or("Sandbox memory allocation failed")?;
 
-        let runtime = RuntimeCapsule::new(name, token.clone(), policy, mem.size);
+        let exec_id = derive_exec_id(manifest.name, token);
+        let policy = manifest.fault_policy.unwrap_or(FaultPolicy::Restart);
+        let runtime = RuntimeCapsule::new(manifest.name, token.clone(), policy, mem.size);
+
+        log_info("sandbox", &format!(
+            "[+] Sandbox '{}' | exec_id={:x?} | cap_len={} | mem={} KB",
+            manifest.name,
+            &exec_id[..4],
+            token.permissions.len(),
+            mem.size / 1024
+        ));
 
         Ok(Self {
-            name,
+            name: manifest.name,
+            exec_id,
             memory: mem,
             token: token.clone(),
             runtime,
         })
     }
 
-    /// Query whether the module is still active
-    pub fn is_alive(&self) -> bool {
+    /// Trigger a secure runtime halt
+    pub fn shutdown(&mut self) {
+        log_warn("sandbox", &format!("Shutting down '{}'", self.name));
+        self.runtime.terminate();
+        // In a production scenario, memory wipe and zeroization should occur here
+        self.memory.zeroize();
+    }
+
+    /// Tick capsule runtime — invoked on IPC or CPU cycles
+    pub fn tick(&mut self) {
+        self.runtime.tick();
+    }
+
+    /// Check liveness
+    pub fn is_active(&self) -> bool {
         self.runtime.is_active()
     }
 
-    /// Mutably access runtime capsule
-    pub fn runtime_mut(&mut self) -> &mut RuntimeCapsule {
-        &mut self.runtime
+    /// Enforce fault policy immediately (used on traps)
+    pub fn enforce_fault(&mut self) {
+        self.runtime.fault();
     }
 
-    /// Immutable view of runtime capsule
+    /// Immutable access to runtime telemetry
     pub fn runtime(&self) -> &RuntimeCapsule {
         &self.runtime
     }
 
-    /// Securely shut down this sandbox (future hook)
-    pub fn shutdown(&mut self) {
-        self.runtime.mark_inactive();
+    /// Mutable access for direct mutation
+    pub fn runtime_mut(&mut self) -> &mut RuntimeCapsule {
+        &mut self.runtime
+    }
+
+    /// Retrieve cryptographic capsule proof
+    pub fn export_attestation(&self) -> AttestationProof {
+        self.runtime.attestation(self.exec_id)
+    }
+
+    /// Retrieve the capsule execution ID
+    pub fn exec_id(&self) -> [u8; 32] {
+        self.exec_id
+    }
+
+    /// Return a summary trace (to be piped into registry/log)
+    pub fn trace_summary(&self) -> &'static str {
+        self.name
     }
 }
