@@ -1,77 +1,110 @@
-//! NØNOS `.mod` Manifest Parser — Extended Edition
+//! NØNOS Modular Runtime: Manifest ABI Definition
 //!
-//! Responsible for deserializing and verifying signed module metadata from structured formats
-//! like CBOR, TOML, or raw memory headers. This parser validates ABI version compatibility,
-//! enforces capability schemas, and prepares safe manifest structs for the modular runtime engine.
+//! This manifest defines the binary interface between sandboxed `.mod` modules
+//! and the NØNOS runtime kernel. It encodes trust-scoped metadata including capability
+//! declarations, cryptographic fingerprints, execution entrypoints, and ABI layout.
+//!
+//! Manifest headers are validated at load-time by the `mod_loader.rs`, and further enforced
+//! by the `sandbox.rs`, `registry.rs`, and `mod_runner.rs` subsystems. This layout must remain
+//! forward-compatible across kernel versions.
 
-use crate::syscall::capabilities::Capability;
-use crate::modules::mod_loader::ModuleManifest;
-use x86_64::PhysAddr;
+use crate::capabilities::Capability;
+use core::fmt;
 
-/// Raw `.mod` manifest extracted from disk, firmware, or boot memory
-#[derive(Debug)]
-pub struct RawManifest {
-    pub name: &'static str,
-    pub version: &'static str,
-    pub author: &'static str,
-    pub abi_level: u16,
-    pub caps: &'static [&'static str],
-    pub hash: [u8; 32],
-    pub signature: [u8; 64],
-    pub memory_base: u64,
-    pub memory_len: u64,
-    pub license: Option<&'static str>,
-    pub description: Option<&'static str>,
-    pub entrypoint: Option<&'static str>,
-    pub timestamp: u64,
+/// 4-byte magic header to identify valid `.mod` manifests
+pub const MANIFEST_MAGIC: [u8; 4] = *b"MODX";
+
+/// Current ABI version for the manifest structure
+pub const MANIFEST_VERSION: u16 = 1;
+
+/// Maximum number of UTF-8 bytes permitted in `module_name`
+pub const MODULE_NAME_MAX: usize = 32;
+
+/// NØNOS Module Manifest Header
+/// 
+/// This header precedes any loadable `.mod` binary. It must be aligned, verified,
+/// and cryptographically validated before any runtime acceptance.
+#[repr(C, packed)]
+#[derive(Clone)]
+pub struct ModuleManifest {
+    pub magic: [u8; 4],                    // Magic identifier: "MODX"
+    pub format_version: u16,              // ABI compatibility layer
+    pub module_name: [u8; MODULE_NAME_MAX], // UTF-8, null-terminated
+    pub version_code: u32,                // Encoded as (major << 16 | minor << 8 | patch)
+    pub hash: [u8; 32],                   // SHA-256 fingerprint of payload
+    pub entrypoint_offset: u64,           // Executable byte offset
+    pub memory_required: u64,             // Requested runtime heap space in bytes
+    pub stack_size: u64,                  // Suggested stack allocation size
+    pub num_caps: u16,                    // Capability count
+    pub caps_ptr: *const Capability,      // Raw pointer to capability array
+    pub signature_ptr: *const u8,         // Optional cryptographic signature
+    pub signature_len: u16,               // Signature length in bytes
+    pub reserved: [u8; 4],                // Alignment / reserved future fields
 }
 
-/// Converts a RawManifest into a kernel-usable ModuleManifest
-pub fn convert_manifest(raw: &RawManifest) -> Result<ModuleManifest, &'static str> {
-    let parsed_caps = parse_caps(raw.caps)?;
+unsafe impl Send for ModuleManifest {}
+unsafe impl Sync for ModuleManifest {}
 
-    Ok(ModuleManifest {
-        name: raw.name,
-        version: raw.version,
-        author: raw.author,
-        abi_level: raw.abi_level,
-        hash: raw.hash,
-        required_caps: parsed_caps,
-        memory_base: PhysAddr::new(raw.memory_base),
-        memory_len: raw.memory_len,
-        signature: raw.signature,
-    })
-}
-
-/// Translates raw string capabilities into typed Capability enums
-fn parse_caps(raw: &[&str]) -> Result<&'static [Capability], &'static str> {
-    const MAX: usize = 16;
-    static mut CAPS: [Capability; MAX] = [Capability::None; MAX];
-    let mut i = 0;
-
-    for &cap in raw.iter() {
-        if i >= MAX {
-            return Err("Too many capabilities declared");
-        }
-
-        CAPS[i] = match cap.to_ascii_lowercase().as_str() {
-            "coreexec" => Capability::CoreExec,
-            "io" => Capability::IO,
-            "ipc" => Capability::IPC,
-            "crypto" => Capability::Crypto,
-            "net" => Capability::Network,
-            _ => return Err("Unrecognized capability"),
-        };
-        i += 1;
+impl ModuleManifest {
+    /// Performs lightweight header validation
+    pub fn is_valid(&self) -> bool {
+        self.magic == MANIFEST_MAGIC &&
+        self.format_version == MANIFEST_VERSION &&
+        self.num_caps as usize <= Capability::MAX_DECLARED
     }
 
-    unsafe { Ok(&CAPS[..i]) }
+    /// Returns module name as string slice
+    pub fn name(&self) -> &str {
+        let nul_pos = self.module_name.iter().position(|&c| c == 0).unwrap_or(MODULE_NAME_MAX);
+        core::str::from_utf8(&self.module_name[..nul_pos]).unwrap_or("<invalid>")
+    }
+
+    /// Fetch declared capabilities slice
+    pub fn declared_capabilities(&self) -> &[Capability] {
+        unsafe { core::slice::from_raw_parts(self.caps_ptr, self.num_caps as usize) }
+    }
+
+    /// Return signature slice if present
+    pub fn signature(&self) -> Option<&[u8]> {
+        if self.signature_len > 0 {
+            unsafe { Some(core::slice::from_raw_parts(self.signature_ptr, self.signature_len as usize)) }
+        } else {
+            None
+        }
+    }
+
+    /// Decode semantic version from packed integer
+    pub fn version(&self) -> (u16, u8, u8) {
+        let major = (self.version_code >> 16) as u16;
+        let minor = ((self.version_code >> 8) & 0xFF) as u8;
+        let patch = (self.version_code & 0xFF) as u8;
+        (major, minor, patch)
+    }
+
+    /// Return formatted version string
+    pub fn version_str(&self) -> alloc::string::String {
+        let (maj, min, patch) = self.version();
+        alloc::format!("{}.{}.{}", maj, min, patch)
+    }
 }
 
-/// Future implementation for blob-to-struct deserialization
-pub fn parse_manifest_from_blob(_blob: &[u8]) -> Result<RawManifest, &'static str> {
-    // This will later support embedded CBOR or binary formats in `.mod`
-    // Example:
-    //   let decoded: RawManifest = cbor::decode(blob)?;
-    Err("[parser] Binary manifest parsing not implemented yet")
+impl fmt::Debug for ModuleManifest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModuleManifest")
+            .field("name", &self.name())
+            .field("version", &self.version_str())
+            .field("entrypoint_offset", &self.entrypoint_offset)
+            .field("memory_required", &self.memory_required)
+            .field("stack_size", &self.stack_size)
+            .field("capabilities", &self.declared_capabilities())
+            .field("signature_len", &self.signature_len)
+            .finish()
+    }
+}
+
+/// ABI-Level Constants
+pub mod abi_consts {
+    pub const ALIGNMENT: usize = 64;
+    pub const HEADER_SIZE: usize = 128;
+    pub const SIGNATURE_MAX: usize = 512;
 }
