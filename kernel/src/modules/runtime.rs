@@ -1,146 +1,160 @@
-//! NØNOS Module Runtime Capsule
+//! NØNOS Capsule Runtime Lifecycle
 //!
-//! This subsystem defines the fully sandboxed, per-module runtime capsule.
-//! Capsules are embedded in sandbox contexts and never globally visible.
-//!
-//! Responsibilities:
-//! - Execution metrics (uptime, restarts, IPC, memory)
-//! - Lifecycle enforcement (fault, suspend, teardown)
-//! - Capability-authenticated introspection
-//! - RAM-only; cleared on ZeroState destruction
+//! Handles full execution lifecycle of modules:
+//! - Execution state transitions
+//! - Fault detection and policy resolution
+//! - Secure telemetry (heartbeat, attestation)
+//! - zkSnapshot generation for cryptographic relay export
+//! - Fully memory-aware and restart-compatible
 
-use crate::capabilities::{Capability, CapabilityToken};
-use crate::modules::sandbox::FaultPolicy;
-use crate::log::logger::{log_warn, log_info};
-use crate::syscall::mod_interface::ModSyscall;
-use crate::crypto::zk::generate_session_entropy;
+use crate::capabilities::CapabilityToken;
+use crate::crypto::zk::{AttestationProof, generate_snapshot_signature};
+use crate::log::logger::{log_info, log_warn};
 
-use core::sync::atomic::{AtomicU64, Ordering};
-use core::time::Duration;
+use core::time::{Duration, Instant};
 use alloc::string::String;
-use alloc::collections::BTreeMap;
 
-/// Globally unique session counter (non-persistent)
-static SESSION_SEQ: AtomicU64 = AtomicU64::new(1000);
-
-/// Runtime telemetry snapshot
-#[derive(Debug, Clone, Default)]
-pub struct RuntimeMetrics {
-    pub restarts: u32,
-    pub faults: u32,
-    pub ipc_sent: u64,
-    pub ipc_recv: u64,
-    pub boot_time_ticks: u64,
-    pub memory_bytes: usize,
-    pub entropy_seed: [u8; 32],
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapsuleState {
+    Inactive,
+    Active,
+    Suspended,
+    Faulted,
+    Terminating,
+    Restarting,
 }
 
-/// Runtime control capsule for an executing `.mod` binary
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultPolicy {
+    /// Restart capsule once fault is detected (default)
+    Restart,
+    /// Gracefully shut down the capsule
+    Shutdown,
+    /// Escalate to system-wide trap
+    Escalate,
+    /// Ignore fault and suspend capsule
+    Suspend,
+}
+
+#[derive(Debug, Clone)]
 pub struct RuntimeCapsule {
-    pub session_id: u64,
-    pub module_name: &'static str,
+    pub name: &'static str,
     pub token: CapabilityToken,
     pub policy: FaultPolicy,
-    pub metrics: RuntimeMetrics,
-    pub active: bool,
-    pub annotations: BTreeMap<&'static str, &'static str>,
+    pub memory_bytes: usize,
+    pub state: CapsuleState,
+    last_heartbeat: Instant,
+    launch_time: Instant,
 }
 
 impl RuntimeCapsule {
-    pub fn new(module: &'static str, token: CapabilityToken, policy: FaultPolicy, memory_bytes: usize) -> Self {
+    /// Construct a new live runtime capsule instance
+    pub fn new(name: &'static str, token: CapabilityToken, policy: FaultPolicy, memory_bytes: usize) -> Self {
+        let now = Instant::now();
+        log_info("runtime", &format!("Capsule '{}' created | policy: {:?} | mem={} KB", name, policy, memory_bytes / 1024));
         Self {
-            session_id: SESSION_SEQ.fetch_add(1, Ordering::Relaxed),
-            module_name: module,
+            name,
             token,
             policy,
-            metrics: RuntimeMetrics {
-                memory_bytes,
-                entropy_seed: generate_session_entropy(),
-                ..Default::default()
-            },
-            active: true,
-            annotations: BTreeMap::new(),
+            memory_bytes,
+            state: CapsuleState::Active,
+            last_heartbeat: now,
+            launch_time: now,
         }
     }
 
-    /// Handle a fatal fault by policy
-    pub fn apply_fault(&mut self) {
-        self.metrics.faults += 1;
-
-        match self.policy {
-            FaultPolicy::Terminate => {
-                self.active = false;
-                log_warn("runtime", &format!("Module '{}' terminated on fault", self.module_name));
-            }
-            FaultPolicy::Restart => {
-                self.metrics.restarts += 1;
-                log_warn("runtime", &format!("Module '{}' faulted — restart queued", self.module_name));
-                // actual restart is external (mod_runner)
-            }
-            FaultPolicy::Isolate => {
-                self.active = false;
-                log_warn("runtime", &format!("Module '{}' isolated from scheduler", self.module_name));
-            }
-        }
-    }
-
+    /// Return true if capsule is live
     pub fn is_active(&self) -> bool {
-        self.active
+        matches!(self.state, CapsuleState::Active)
     }
 
+    /// Lifecycle transition: mark capsule inactive
     pub fn mark_inactive(&mut self) {
-        self.active = false;
+        self.state = CapsuleState::Inactive;
+        log_info("runtime", &format!("Capsule '{}' marked Inactive", self.name));
     }
 
-    /// Update IPC metrics
-    pub fn record_ipc(&mut self, direction: IPCDirection) {
-        match direction {
-            IPCDirection::Sent => self.metrics.ipc_sent += 1,
-            IPCDirection::Received => self.metrics.ipc_recv += 1,
+    /// Lifecycle transition: suspend capsule
+    pub fn suspend(&mut self) {
+        self.state = CapsuleState::Suspended;
+        log_warn("runtime", &format!("Capsule '{}' suspended due to soft fault", self.name));
+    }
+
+    /// Lifecycle transition: faulted
+    pub fn fault(&mut self) {
+        self.state = CapsuleState::Faulted;
+        log_warn("runtime", &format!("Capsule '{}' entered Faulted state", self.name));
+        self.resolve_policy();
+    }
+
+    /// Lifecycle transition: termination
+    pub fn terminate(&mut self) {
+        self.state = CapsuleState::Terminating;
+        log_warn("runtime", &format!("Capsule '{}' is terminating", self.name));
+    }
+
+    /// Apply fault policy after failure
+    fn resolve_policy(&mut self) {
+        match self.policy {
+            FaultPolicy::Restart => {
+                self.state = CapsuleState::Restarting;
+                log_info("runtime", &format!("Capsule '{}' set to restart", self.name));
+            }
+            FaultPolicy::Shutdown => {
+                self.state = CapsuleState::Terminating;
+                log_info("runtime", &format!("Capsule '{}' set to shutdown", self.name));
+            }
+            FaultPolicy::Suspend => self.suspend(),
+            FaultPolicy::Escalate => {
+                // TODO: Signal system-wide fault escalation mechanism
+                log_warn("runtime", &format!("Capsule '{}' triggered escalation", self.name));
+            }
         }
     }
 
-    /// Annotate runtime state with debug label
-    pub fn annotate(&mut self, key: &'static str, value: &'static str) {
-        self.annotations.insert(key, value);
+    /// Update capsule heartbeat (activity tick)
+    pub fn tick(&mut self) {
+        self.last_heartbeat = Instant::now();
     }
 
-    /// Kernel-syscall readable summary
-    pub fn describe(&self, caller: &CapabilityToken) -> Option<RuntimeCapsuleInfo> {
-        if !caller.allows(Capability::Debug) {
-            return None;
+    /// Seconds since last activity tick
+    pub fn last_seen(&self) -> Duration {
+        self.last_heartbeat.elapsed()
+    }
+
+    /// Uptime since capsule launched
+    pub fn uptime(&self) -> Duration {
+        self.launch_time.elapsed()
+    }
+
+    /// Memory footprint in bytes
+    pub fn memory_bytes(&self) -> usize {
+        self.memory_bytes
+    }
+
+    /// Current runtime state
+    pub fn state(&self) -> CapsuleState {
+        self.state
+    }
+
+    /// Current fault handling policy
+    pub fn fault_policy(&self) -> FaultPolicy {
+        self.policy
+    }
+
+    /// Export cryptographic zkSnapshot (signed execution metadata)
+    pub fn generate_signed_snapshot(&self, exec_id: [u8; 32]) -> [u8; 64] {
+        generate_snapshot_signature(exec_id, &self.token, self.memory_bytes, self.state)
+    }
+
+    /// Export high-level attestation proof (for zkRelay export)
+    pub fn attestation(&self, exec_id: [u8; 32]) -> AttestationProof {
+        AttestationProof {
+            exec_id,
+            state: self.state,
+            memory_used: self.memory_bytes,
+            uptime: self.uptime().as_secs(),
+            proof: self.generate_signed_snapshot(exec_id),
         }
-
-        Some(RuntimeCapsuleInfo {
-            module: self.module_name,
-            session_id: self.session_id,
-            memory: self.metrics.memory_bytes,
-            restarts: self.metrics.restarts,
-            faults: self.metrics.faults,
-            active: self.active,
-            boot_ticks: self.metrics.boot_time_ticks,
-            annotations: self.annotations.clone(),
-        })
     }
-}
-
-/// Lightweight debug representation exposed via syscall with Capability::Debug
-#[derive(Debug, Clone)]
-pub struct RuntimeCapsuleInfo {
-    pub module: &'static str,
-    pub session_id: u64,
-    pub memory: usize,
-    pub restarts: u32,
-    pub faults: u32,
-    pub active: bool,
-    pub boot_ticks: u64,
-    pub annotations: BTreeMap<&'static str, &'static str>,
-}
-
-/// IPC operation direction enum
-#[derive(Debug, Copy, Clone)]
-pub enum IPCDirection {
-    Sent,
-    Received,
 }
