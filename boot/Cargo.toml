@@ -1,0 +1,15 @@
+[package]
+name = "nonos_boot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+uefi = "0.27.0"
+uefi-services = "0.24.0"
+x86_64 = "0.14.10"
+elf = "0.7.2"
+log = "0.4"
+sha2 = { version = "0.10", default-features = false }
+digest = { version = "0.10", default-features = false }
+
+[build-dependencies]

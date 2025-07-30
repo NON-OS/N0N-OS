@@ -1,0 +1,8 @@
+{
+    "out": "docs",
+    "entryPoints": ["src/index.ts"],
+    "excludeExternals": true,
+    "excludePrivate": true,
+    "excludeProtected": true,
+    "tsconfig": "tsconfig.json"
+  }

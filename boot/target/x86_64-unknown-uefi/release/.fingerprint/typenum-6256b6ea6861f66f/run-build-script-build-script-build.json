@@ -1,0 +1,1 @@
+{"rustc":11410426090777951712,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[17001665395952474378,"build_script_build",false,585038490168105057]],"local":[{"RerunIfChanged":{"output":"x86_64-unknown-uefi/release/build/typenum-6256b6ea6861f66f/output","paths":["tests"]}}],"rustflags":[],"config":0,"compile_kind":0}
