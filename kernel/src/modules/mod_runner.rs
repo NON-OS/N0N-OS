@@ -1,97 +1,110 @@
-//! NØNOS Module Runtime Executor
+//! NØNOS Capsule Runner 
 //!
-//! This is the secure `.mod` execution handler for the NØNOS OS. It handles:
-//! - Module lifecycle management (launch, track, teardown)
-//! - Memory sandboxing with strict zero-trust enforcement
-//! - Capability-driven IPC bindings
-//! - Cryptographic bootstrapping
-//! - Scheduler integration for cooperative tasking
-//!
-//! Modules must pass `manifest` and `vault` validation prior to boot.
+//! Converts trusted module admission records into isolated sandboxed runtime capsules.
+//! Emits full audit trace, runtime attestation, and memory-scoped isolation.
 
-use crate::kernel::src::modules::manifest::ModuleManifest;
-use crate::kernel::src::modules::sandbox::SandboxContext;
-use crate::kernel::src::modules::registry::{register_module_instance, is_registered, unregister_module};
-use crate::sched::scheduler::{spawn_task, TaskId};
-use crate::memory::region::{allocate_region, MemoryRegion};
-use crate::ipc::channel::bind_module_ipc;
-use crate::capabilities::{CapabilityToken, Capability};
+use crate::modules::mod_loader::ModuleAdmission;
+use crate::modules::sandbox::SandboxContext;
+use crate::modules::registry::{register_module};
 use crate::log::logger::{log_info, log_warn};
-use crate::crypto::vault::verify_signature;
+use crate::runtime::zerostate::{track_active_sandbox};
+use crate::crypto::zk::{derive_exec_id, hash_capsule};
+use crate::modules::auth::CapabilityAttestation;
+use crate::capabilities::CapabilityToken;
 
-use alloc::string::String;
-use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
+/// Result of a verified module launch
+#[derive(Debug)]
+pub enum LaunchResult {
+    Success(LaunchAudit),
+    LaunchFailed(&'static str),
+}
 
-static MODULE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Active module instance representation
-pub struct ModuleInstance {
-    pub id: TaskId,
-    pub ident: u64,
-    pub manifest: &'static ModuleManifest,
-    pub memory: MemoryRegion,
-    pub sandbox: SandboxContext,
+/// Cryptographic audit snapshot of a launched capsule
+#[derive(Debug)]
+pub struct LaunchAudit {
+    pub module_name: &'static str,
+    pub exec_id: [u8; 32],
+    pub capsule_fingerprint: [u8; 32],
     pub token: CapabilityToken,
+    pub memory_bytes: usize,
+    pub attested: bool,
 }
 
-/// Securely launch a `.mod` binary in isolated context
-pub fn launch_module(manifest: &'static ModuleManifest, token: CapabilityToken) -> Result<ModuleInstance, &'static str> {
-    if !manifest.is_valid() {
-        return Err("Manifest verification failed");
-    }
-    if is_registered(manifest.name()) {
-        return Err("Module already loaded");
-    }
-    if let Some(sig) = manifest.signature() {
-        if !verify_signature(manifest.hash, sig) {
-            return Err("Signature verification failed");
-        }
-    }
+/// Launch and register a runtime capsule from admission
+pub fn launch_module(admission: ModuleAdmission) -> LaunchResult {
+    log_info("mod_runner", &format!(
+        "Launching '{}' | caps: {:?} | mem: {} bytes",
+        admission.manifest.name,
+        admission.token().permissions,
+        admission.memory.size
+    ));
 
-    let mem = allocate_region(manifest.memory_required as usize)
-        .ok_or("Memory allocation failure")?;
+    let exec_id = derive_exec_id(admission.manifest.name, admission.token());
 
-    let sandbox = SandboxContext::new(manifest.name(), mem.clone(), &token)?;
-
-    bind_module_ipc(manifest.name())?;
-
-    let entry: NonNull<u8> = unsafe {
-        let base = mem.base.as_ptr();
-        NonNull::new(base.add(manifest.entrypoint_offset as usize)).ok_or("Entrypoint pointer invalid")?
+    // Step 1: Construct sandbox context
+    let context = match SandboxContext::new(
+        admission.manifest,
+        admission.memory,
+        admission.token(),
+    ) {
+        Ok(ctx) => ctx,
+        Err(_) => return LaunchResult::LaunchFailed("Sandbox context failed"),
     };
 
-    let id = spawn_task(entry, sandbox.clone())?;
-    let ident = MODULE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+    // Step 2: Track capsule in RAM
+    track_active_sandbox(&context);
 
-    let instance = ModuleInstance {
-        id,
-        ident,
-        manifest,
-        memory: mem,
-        sandbox,
-        token,
-    };
+    // Step 3: Fingerprint capsule state for audit log
+    let capsule_hash = hash_capsule(
+        admission.manifest,
+        admission.token(),
+        context.memory.start_addr,
+        context.memory.size,
+    );
 
-    register_module_instance(manifest.name(), &instance);
-    log_info("mod_runner", &alloc::format!("Module '{}' (#{}) launched with Task ID #{:?}", manifest.name(), ident, id));
+    // Step 4: Register to ZeroState registry
+    register_module(
+        admission.uid,
+        admission.manifest,
+        &context.runtime,
+        exec_id,
+        admission.attestation.signed_proof,
+    );
 
-    Ok(instance)
+    log_info("mod_runner", &format!(
+        "Launched '{}' → exec_id={:x?} | fingerprint={:x?}",
+        context.name,
+        &exec_id[..6],
+        &capsule_hash[..6],
+    ));
+
+    LaunchResult::Success(LaunchAudit {
+        module_name: context.name,
+        exec_id,
+        capsule_fingerprint: capsule_hash,
+        token: context.token.clone(),
+        memory_bytes: context.memory.size,
+        attested: true,
+    })
 }
 
-/// Terminate a running module instance (future extension)
-pub fn shutdown_module(name: &str) -> Result<(), &'static str> {
-    if !is_registered(name) {
-        return Err("Module not found");
+/// Perform a dry-run capsule load for audit or bootstrap (no execution)
+pub fn simulate_launch(admission: &ModuleAdmission) -> LaunchAudit {
+    let exec_id = derive_exec_id(admission.manifest.name, admission.token());
+
+    let capsule_hash = hash_capsule(
+        admission.manifest,
+        admission.token(),
+        admission.memory.start_addr,
+        admission.memory.size,
+    );
+
+    LaunchAudit {
+        module_name: admission.manifest.name,
+        exec_id,
+        capsule_fingerprint: capsule_hash,
+        token: admission.token().clone(),
+        memory_bytes: admission.memory.size,
+        attested: true,
     }
-    // TODO: Cancel associated task, release memory, drop sandbox
-    unregister_module(name);
-    log_warn("mod_runner", &alloc::format!("Module '{}' shutdown invoked", name));
-    Ok(())
-}
-
-/// Hot-restart a live module with the same manifest + token
-pub fn restart_module(manifest: &'static ModuleManifest, token: CapabilityToken) -> Result<ModuleInstance, &'static str> {
-    shutdown_module(manifest.name()).ok();
-    launch_module(manifest, token)
 }
