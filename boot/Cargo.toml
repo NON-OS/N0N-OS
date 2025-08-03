@@ -2,14 +2,53 @@
 name = "nonos_boot"
 version = "0.1.0"
 edition = "2021"
+authors = ["NØNOS Contributors <dev@nonos-tech.xyz>"]
+description = "NØN•OS Capsule Bootloader — UEFI stage-0 loader for zero-trust capsule execution"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/NON-OS/N0N-OS"
+keywords = ["bootloader", "uefi", "zkproof", "os", "capsule"]
+categories = ["os::boot", "cryptography", "security"]
+readme = "../README.md"
+documentation = "https://docs.nonos-tech.xyz/boot"
 
 [dependencies]
-uefi = "0.27.0"
-uefi-services = "0.24.0"
-x86_64 = "0.14.10"
-elf = "0.7.2"
+uefi = { version = "0.23", features = ["alloc"] }
+uefi-services = "0.20"
+r-efi = "4.0.0"
 log = "0.4"
-sha2 = { version = "0.10", default-features = false }
-digest = { version = "0.10", default-features = false }
+xmas-elf = "0.8"
+zerocopy = "0.6"
+sha2 = "0.10"
+bitflags = "2.4"
+uuid = { version = "1.6", features = ["v4", "macro-diagnostics"] }
+
+# Capsule cryptographic pipeline
+blake3 = "1.5"
+rand = { version = "0.8", features = ["std"] }
+digest = "0.10"
+halo2_proofs = { version = "0.2", optional = true }    # Future support for zkProofs
+snarkvm = { version = "0.11", optional = true }
+
+# Internal UI logger abstraction
+[target.'cfg(uefi)'.dependencies]
+uefi-alloc = "0.1"
+
+[features]
+default = ["logging"]
+logging = []
+zk-snark = ["halo2_proofs"]
+zk-snarkvm = ["snarkvm"]
 
 [build-dependencies]
+cc = "1.0"
+embed-manifest = "1.4.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
+codegen-units = 1
+debug = false
+
+[workspace]
