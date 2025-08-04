@@ -1,142 +1,183 @@
-// cli/src/nonosctl/logging.rs — NØN-OS Sovereign Audit Engine w/ Hash Chain
+// cli/src/nonosctl/logging.rs — NØN-OS / Logging Engine v2.5
+// Maintained by ek@nonos-tech.xyz | © 2025 NØN Technologies
+// Structured, signed, and decentralized log infrastructure
 
-use chrono::{Utc};
-use serde::{Serialize, Deserialize};
 use std::fs::{self, OpenOptions};
-use std::io::{BufReader, BufRead, Write};
-use std::collections::HashMap;
-use sha2::{Sha256, Digest};
+use std::io::{Write, BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use chrono::Utc;
+use serde::{Serialize, Deserialize};
+use uuid::Uuid;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use ed25519_dalek::{Keypair, Signature, Signer};
+use rand::rngs::OsRng;
 
-const AUDIT_LOG: &str = "/var/nonos/logs/audit.log";
+const BASE_LOG_DIR: &str = "/var/log/nonos";
+const INDEX_FILE: &str = "/var/log/nonos/index.json";
+const ROTATE_SIZE: u64 = 1_048_576;
+const EXPORT_DIR: &str = "/var/nonos/audit/";
+const SECRET_KEY: &[u8] = b"nonos-secret-key-hmac";
+const LOCAL_SIGNER_ID: &str = "capsule://local-node-001";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Event {
-    pub timestamp: String,
-    pub scope: String,
-    pub actor: String,
-    pub action: String,
-    pub source: String,
-    pub detail: String,
-    pub hash: String,
-    pub prev_hash: String,
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum LogKind {
+    Auth,
+    Capsule,
+    System,
+    Network,
+    Telemetry,
 }
 
-pub fn log_event(scope: &str, actor: &str, action: &str, source: &str, detail: &str) {
-    let prev_hash = get_last_hash();
-    let raw_data = format!("{}:{}:{}:{}:{}:{}:{}", Utc::now(), scope, actor, action, source, detail, prev_hash);
-    let hash = format!("{:x}", Sha256::digest(raw_data.as_bytes()));
+impl LogKind {
+    fn filename(&self) -> &'static str {
+        match self {
+            LogKind::Auth => "auth.log",
+            LogKind::Capsule => "capsules.log",
+            LogKind::System => "system.log",
+            LogKind::Network => "network.log",
+            LogKind::Telemetry => "telemetry.log",
+        }
+    }
+}
 
-    let event = Event {
-        timestamp: Utc::now().to_rfc3339(),
-        scope: scope.to_string(),
-        actor: actor.to_string(),
-        action: action.to_string(),
-        source: source.to_string(),
-        detail: detail.to_string(),
-        hash,
-        prev_hash,
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LogEntry {
+    pub timestamp: String,
+    pub session: String,
+    pub component: String,
+    pub level: String,
+    pub message: String,
+    pub kind: LogKind,
+    pub metadata: Option<LogMeta>,
+    pub integrity: String,
+    pub signed_by: String,
+    pub detached_sig: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LogMeta {
+    pub user_id: Option<String>,
+    pub request_id: Option<String>,
+    pub capsule: Option<String>,
+}
+
+pub fn log_event(
+    component: &str,
+    level: &str,
+    message: &str,
+    kind: LogKind,
+    meta: Option<LogMeta>,
+    session_id: Option<String>,
+) {
+    let session = session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let timestamp = Utc::now().to_rfc3339();
+
+    let raw = format!("{}|{}|{}|{}|{}", &timestamp, &session, &component, &level, &message);
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(SECRET_KEY).expect("HMAC setup failed");
+    mac.update(raw.as_bytes());
+    let integrity = hex::encode(mac.finalize().into_bytes());
+
+    let keypair: Keypair = Keypair::generate(&mut OsRng);
+    let sig: Signature = keypair.sign(raw.as_bytes());
+
+    let entry = LogEntry {
+        timestamp,
+        session,
+        component: component.into(),
+        level: level.into(),
+        message: message.into(),
+        kind: kind.clone(),
+        metadata: meta,
+        integrity,
+        signed_by: LOCAL_SIGNER_ID.into(),
+        detached_sig: hex::encode(sig.to_bytes()),
     };
 
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(AUDIT_LOG) {
-        if let Ok(json) = serde_json::to_string(&event) {
-            let _ = writeln!(file, "{}", json);
+    let json_line = serde_json::to_string(&entry).unwrap();
+    let path = Path::new(BASE_LOG_DIR).join(kind.filename());
+    fs::create_dir_all(BASE_LOG_DIR).ok();
+    let _ = OpenOptions::new().create(true).append(true).open(&path)
+        .and_then(|mut f| writeln!(f, "{}", json_line));
+
+    rotate_if_needed(&path);
+    update_index(&entry);
+}
+
+fn rotate_if_needed(path: &Path) {
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.len() > ROTATE_SIZE {
+            let ts = Utc::now().format("%Y%m%d%H%M%S");
+            let rotated = path.with_extension(format!("log.{}", ts));
+            let _ = fs::rename(path, rotated);
         }
     }
 }
 
-fn get_last_hash() -> String {
-    if let Ok(file) = fs::File::open(AUDIT_LOG) {
-        let reader = BufReader::new(file);
-        if let Some(last_line) = reader.lines().flatten().last() {
-            if let Ok(evt) = serde_json::from_str::<Event>(&last_line) {
-                return evt.hash;
-            }
-        }
-    }
-    "GENESIS".to_string()
-}
-
-pub fn view_audit_log(limit: usize) {
-    if let Ok(file) = fs::File::open(AUDIT_LOG) {
-        let reader = BufReader::new(file);
-        let lines: Vec<_> = reader.lines().filter_map(Result::ok).collect();
-
-        for line in lines.iter().rev().take(limit).rev() {
-            if let Ok(evt) = serde_json::from_str::<Event>(line) {
-                println!("[{}][{}][{}][{}] {} => {} | #{} <- {}", evt.timestamp, evt.scope, evt.source, evt.actor, evt.action, evt.detail, &evt.hash[..8], &evt.prev_hash[..8]);
-            }
-        }
+fn update_index(entry: &LogEntry) {
+    let mut index: Vec<LogEntry> = if Path::new(INDEX_FILE).exists() {
+        let data = fs::read_to_string(INDEX_FILE).unwrap_or_default();
+        serde_json::from_str(&data).unwrap_or_default()
     } else {
-        println!("[log] audit log not found.");
+        vec![]
+    };
+
+    index.push(entry.clone());
+    if index.len() > 5000 {
+        index.drain(0..(index.len() - 5000));
+    }
+    let _ = fs::write(INDEX_FILE, serde_json::to_string_pretty(&index).unwrap());
+}
+
+pub fn show_log(kind: LogKind, filter_level: Option<&str>, filter_component: Option<&str>, lines: usize) {
+    let path = Path::new(BASE_LOG_DIR).join(kind.filename());
+    if !path.exists() {
+        println!("[log] no {:?} log available.", kind);
+        return;
+    }
+
+    let file = fs::File::open(&path).unwrap();
+    let reader = BufReader::new(file);
+    let entries: Vec<_> = reader
+        .lines()
+        .flatten()
+        .filter_map(|line| serde_json::from_str::<LogEntry>(&line).ok())
+        .collect();
+
+    let recent = &entries[entries.len().saturating_sub(lines)..];
+    for entry in recent {
+        if filter_level.map_or(true, |lvl| entry.level == lvl)
+            && filter_component.map_or(true, |cmp| entry.component == cmp) {
+            println!("[{}] [{}] ({}): {} :: signed_by {}", entry.timestamp, entry.level, entry.component, entry.message, entry.signed_by);
+        }
     }
 }
 
-pub fn flush_audit_log() {
-    if fs::write(AUDIT_LOG, b"").is_ok() {
-        println!("[log] audit log flushed.");
-    } else {
-        println!("[log] failed to flush audit log.");
-    }
+pub fn export_logs() {
+    fs::create_dir_all(EXPORT_DIR).ok();
+    let ts = Utc::now().format("%Y%m%d-%H%M%S");
+    let target = Path::new(EXPORT_DIR).join(format!("logbundle-{}.tar.gz", ts));
+    let _ = std::process::Command::new("tar")
+        .arg("czf")
+        .arg(&target)
+        .arg(BASE_LOG_DIR)
+        .status();
+    println!("[log] logs exported to {:?}", target);
 }
 
-pub fn filter_by_scope(scope: &str) {
-    if let Ok(file) = fs::File::open(AUDIT_LOG) {
-        let reader = BufReader::new(file);
-        for line in reader.lines().flatten() {
-            if let Ok(evt) = serde_json::from_str::<Event>(&line) {
-                if evt.scope == scope {
-                    println!("[{}][{}][{}][{}] {} => {}", evt.timestamp, evt.scope, evt.source, evt.actor, evt.action, evt.detail);
-                }
+pub fn clear_logs(kind: Option<LogKind>) {
+    match kind {
+        Some(k) => {
+            let path = Path::new(BASE_LOG_DIR).join(k.filename());
+            let _ = fs::write(path, "");
+        },
+        None => {
+            for k in [LogKind::Auth, LogKind::System, LogKind::Capsule, LogKind::Network, LogKind::Telemetry] {
+                let path = Path::new(BASE_LOG_DIR).join(k.filename());
+                let _ = fs::write(path, "");
             }
         }
     }
+    println!("[log] logs cleared.");
 }
-
-pub fn filter_by_actor(actor: &str) {
-    if let Ok(file) = fs::File::open(AUDIT_LOG) {
-        let reader = BufReader::new(file);
-        for line in reader.lines().flatten() {
-            if let Ok(evt) = serde_json::from_str::<Event>(&line) {
-                if evt.actor == actor {
-                    println!("[{}][{}][{}][{}] {} => {}", evt.timestamp, evt.scope, evt.source, evt.actor, evt.action, evt.detail);
-                }
-            }
-        }
-    }
-}
-
-pub fn audit_stats() {
-    let mut totals: HashMap<String, usize> = HashMap::new();
-    let mut failures = 0;
-
-    if let Ok(file) = fs::File::open(AUDIT_LOG) {
-        let reader = BufReader::new(file);
-        for line in reader.lines().flatten() {
-            if let Ok(evt) = serde_json::from_str::<Event>(&line) {
-                *totals.entry(evt.scope.clone()).or_insert(0) += 1;
-                if evt.action.contains("fail") || evt.detail.contains("denied") {
-                    failures += 1;
-                }
-            }
-        }
-    }
-
-    println!("[stats] total scopes:");
-    for (scope, count) in totals {
-        println!("  {}: {} events", scope, count);
-    }
-    println!("[stats] failure-related events: {}", failures);
-}
-
-pub fn export_audit_log(output_path: &str) {
-    if let Ok(content) = fs::read_to_string(AUDIT_LOG) {
-        if fs::write(output_path, content).is_ok() {
-            println!("[log] exported audit log to '{}'.", output_path);
-        } else {
-            println!("[log] failed to write export.");
-        }
-    } else {
-        println!("[log] audit log missing, cannot export.");
-    }
-}
-
