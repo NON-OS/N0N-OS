@@ -1,204 +1,218 @@
-// cli/src/nonosctl/capsules.rs — NØN-OS Capsule Operations (Advanced Execution + Telemetry)
+// cli/src/nonosctl/capsule.rs — Capsule System for NØN-OS
+// Maintained by ek@nonos-tech.xyz | © 2025 NØN Technologies
+// Capsule operations follow strict privacy & digital sovereignty principles.
 
-use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use sha2::{Sha256, Digest};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-const CAPSULE_DIR: &str = "/var/nonos/capsules/";
-const CAPSULE_INDEX: &str = "/var/nonos/runtime/capsule_index.json";
-const CAPSULE_LOG_DIR: &str = "/var/nonos/logs/";
+use crate::logging::log_event;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CapsuleMeta {
+const CAPSULE_DB: &str = "/var/nonos/capsules/index.json";
+const CAPSULE_DIR: &str = "/var/nonos/capsules";
+const LOG_DIR: &str = "/var/nonos/capsules/logs";
+const TELEMETRY_DIR: &str = "/var/nonos/capsules/telemetry";
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CapsuleInfo {
+    pub api_version: String,
     pub name: String,
-    pub version: String,
-    pub hash: String,
     pub path: String,
-    pub deployed: bool,
-    pub last_updated: String,
-    pub tags: Option<HashMap<String, String>>,
+    pub deployed_at: String,
+    pub checksum: String,
+    pub mode: String,
+    pub permissions: Vec<String>,
 }
 
-pub fn deploy_capsule(name: &str, path: &str) {
-    let dest_path = format!("{}{}", CAPSULE_DIR, name);
-    match fs::copy(path, &dest_path) {
-        Ok(_) => {
-            let hash = calculate_hash(&dest_path);
-            let meta = CapsuleMeta {
-                name: name.into(),
-                version: "1.0.0".into(),
-                hash,
-                path: dest_path.clone(),
-                deployed: true,
-                last_updated: Utc::now().to_rfc3339(),
-                tags: Some(HashMap::new()),
-            };
-            store_capsule_meta(name, &meta);
-            println!("[capsule] '{}' deployed successfully.", name);
-        }
-        Err(e) => println!("[capsule] deploy failed: {}", e),
+pub fn deploy_capsule(name: &str, source_path: &str) {
+    let target_path = format!("{}/{}", CAPSULE_DIR, name);
+    let deployed_at = Utc::now().to_rfc3339();
+
+    if !Path::new(source_path).exists() {
+        println!("[capsule] error: source '{}' does not exist.", source_path);
+        return;
     }
+
+    fs::create_dir_all(LOG_DIR).ok();
+    fs::create_dir_all(TELEMETRY_DIR).ok();
+
+    fs::copy(source_path, &target_path).expect("[capsule] failed to copy binary");
+
+    let checksum = compute_sha256(&target_path).unwrap_or_else(|_| "<error>".into());
+
+    let mut capsule = CapsuleInfo {
+        api_version: "v1".into(),
+        name: name.into(),
+        path: target_path.clone(),
+        deployed_at,
+        checksum,
+        mode: "SAFE".into(),
+        permissions: vec!["net".into(), "fs".into()],
+    };
+
+    // If manifest file exists next to source, parse and override config
+    let manifest_path = Path::new(source_path).with_file_name("manifest.toml");
+    if manifest_path.exists() {
+        if let Ok(contents) = fs::read_to_string(manifest_path) {
+            let parsed: toml::Value = toml::from_str(&contents).unwrap_or_default();
+            if let Some(mode) = parsed.get("mode").and_then(|v| v.as_str()) {
+                capsule.mode = mode.into();
+            }
+            if let Some(perms) = parsed.get("permissions").and_then(|v| v.as_array()) {
+                capsule.permissions = perms.iter().filter_map(|p| p.as_str().map(String::from)).collect();
+            }
+        }
+    }
+
+    let mut index = read_index();
+    index.insert(name.into(), capsule.clone());
+
+    let json = serde_json::to_string_pretty(&index).unwrap();
+    fs::write(CAPSULE_DB, json).expect("[capsule] failed to write DB");
+    log_event("capsule", name, "deploy", "capsule.rs", "capsule deployed");
+    println!("[capsule] '{}' deployed successfully.", name);
 }
 
-pub fn run_capsule(name: &str, args: &[&str]) {
-    if let Some(meta) = load_capsule_meta(name) {
-        if Path::new(&meta.path).exists() {
-            match Command::new(&meta.path)
-                .args(args)
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn() {
-                Ok(mut child) => {
-                    let _ = child.wait();
-                }
-                Err(e) => println!("[capsule] failed to execute '{}': {}", name, e),
-            }
-        } else {
-            println!("[capsule] binary '{}' missing at path: {}", name, meta.path);
+pub fn run_capsule(name: &str) {
+    let index = read_index();
+    if let Some(info) = index.get(name) {
+        println!("[capsule] running '{}'...", name);
+        let log_path = format!("{}/{}.log", LOG_DIR, name);
+        let telemetry_path = format!("{}/{}.json", TELEMETRY_DIR, name);
+
+        if info.mode == "RAW" && cfg!(feature = "safe") {
+            println!("[capsule] execution blocked: '{}' requires RAW mode but system is in SAFE mode.", name);
+            return;
+        }
+
+        let start_time = Utc::now();
+        let result = Command::new(&info.path)
+            .env("NONOS_MODE", &info.mode)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+
+        match result {
+            Ok(out) => {
+                fs::write(&log_path, &out.stdout).ok();
+                fs::write(&telemetry_path, serde_json::json!({
+                    "name": name,
+                    "exit_code": out.status.code(),
+                    "ran_at": start_time.to_rfc3339(),
+                    "duration_ms": Utc::now().signed_duration_since(start_time).num_milliseconds()
+                }).to_string()).ok();
+
+                rotate_log_if_needed(&log_path);
+                log_event("capsule", name, "run", "capsule.rs", "capsule executed");
+                println!("[capsule] execution complete.");
+            },
+            Err(e) => println!("[capsule] error: {}", e),
         }
     } else {
         println!("[capsule] '{}' not found.", name);
     }
 }
 
-pub fn capsule_logs(name: &str) {
-    let log_path = format!("{}{}.log", CAPSULE_LOG_DIR, name);
-    match fs::read_to_string(&log_path) {
-        Ok(content) => println!("{}", content),
-        Err(_) => println!("[capsule] no logs found for '{}'.", name),
-    }
-}
-
-pub fn stream_capsule(name: &str) {
-    let log_path = format!("{}{}.log", CAPSULE_LOG_DIR, name);
-    if !Path::new(&log_path).exists() {
-        println!("[capsule] log file not found for '{}'.", name);
-        return;
-    }
-    let _ = Command::new("tail")
-        .arg("-f")
-        .arg(log_path)
-        .status();
-}
-
-pub fn search_capsules(keyword: &str) {
-    let index = load_capsule_index();
-    let results: Vec<_> = index.iter()
-        .filter(|(_, meta)|
-            meta.name.contains(keyword)
-            || meta.hash.contains(keyword)
-            || meta.version.contains(keyword))
-        .collect();
-
-    if results.is_empty() {
-        println!("[capsule] no matches found for '{}'.", keyword);
-    } else {
-        for (k, v) in results {
-            println!("[capsule] match '{}': {} v{}", k, v.hash, v.version);
-        }
-    }
-}
-
-pub fn tag_capsule(name: &str, key: &str, value: &str) {
-    let mut index = load_capsule_index();
-    if let Some(meta) = index.get_mut(name) {
-        if let Some(tags) = &mut meta.tags {
-            tags.insert(key.to_string(), value.to_string());
-            save_capsule_index(&index);
-            println!("[capsule] tag added: {}={}", key, value);
-        }
-    } else {
-        println!("[capsule] '{}' not found for tagging.", name);
-    }
-}
-
 pub fn verify_capsule(name: &str) {
-    if let Some(meta) = load_capsule_meta(name) {
-        let actual_hash = calculate_hash(&meta.path);
-        if actual_hash == meta.hash {
-            println!("[capsule] '{}' verified OK.", name);
+    let db = read_index();
+    if let Some(capsule) = db.get(name) {
+        let current = compute_sha256(&capsule.path).unwrap_or_default();
+        if current == capsule.checksum {
+            println!("[verify] ✅ '{}' passed integrity check.", name);
         } else {
-            println!("[capsule] '{}' integrity FAILED.", name);
+            println!("[verify] ❌ '{}' checksum mismatch.", name);
         }
+    } else {
+        println!("[verify] capsule '{}' not found.", name);
     }
 }
 
-pub fn inspect_capsule(name: &str) {
-    let meta = load_capsule_meta(name);
-    match meta {
-        Some(m) => {
-            println!("[capsule] '{}':", name);
-            println!(" - version: {}", m.version);
-            println!(" - hash: {}", m.hash);
-            println!(" - path: {}", m.path);
-            println!(" - deployed: {}", m.deployed);
-            println!(" - last updated: {}", m.last_updated);
-            if let Some(tags) = m.tags {
-                for (k, v) in tags.iter() {
-                    println!("   [tag] {} = {}", k, v);
-                }
-            }
-        }
-        None => println!("[capsule] '{}' not found in index.", name),
-    }
-}
-
-pub fn remove_capsule(name: &str) {
-    if let Some(meta) = load_capsule_meta(name) {
-        if fs::remove_file(&meta.path).is_ok() {
-            remove_capsule_meta(name);
-            println!("[capsule] '{}' removed from system.", name);
+pub fn capsule_info(name: &str, json_out: bool) {
+    let index = read_index();
+    if let Some(info) = index.get(name) {
+        if json_out {
+            println!("{}", serde_json::to_string_pretty(info).unwrap());
         } else {
-            println!("[capsule] failed to remove '{}'.", name);
+            println!("[capsule] '{}': {:?}", name, info);
+        }
+    } else {
+        println!("[capsule] '{}' not found.", name);
+    }
+}
+
+pub fn list_capsules(json_out: bool) {
+    let index = read_index();
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&index).unwrap());
+    } else {
+        for (name, info) in index.iter() {
+            println!("- {} [{}]", name, info.mode);
         }
     }
 }
 
-fn calculate_hash(path: &str) -> String {
-    let mut file = File::open(path).expect("Unable to open file for hash");
+pub fn capsule_logs(name: &str) {
+    let log_path = format!("{}/{}.log", LOG_DIR, name);
+    if Path::new(&log_path).exists() {
+        let content = fs::read_to_string(log_path).unwrap_or_default();
+        println!("[logs:{}]
+{}", name, content);
+    } else {
+        println!("[capsule] no logs found for '{}'.", name);
+    }
+}
+
+pub fn delete_capsule(name: &str) {
+    let mut index = read_index();
+    if let Some(info) = index.remove(name) {
+        fs::remove_file(&info.path).ok();
+        fs::remove_file(format!("{}/{}.log", LOG_DIR, name)).ok();
+        fs::remove_file(format!("{}/{}.json", TELEMETRY_DIR, name)).ok();
+        let _ = fs::write(CAPSULE_DB, serde_json::to_string_pretty(&index).unwrap());
+        log_event("capsule", name, "delete", "capsule.rs", "capsule deleted");
+        println!("[capsule] '{}' deleted.", name);
+    } else {
+        println!("[capsule] '{}' not found.", name);
+    }
+}
+
+fn compute_sha256(path: &str) -> Result<String, std::io::Error> {
+    let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 4096];
     loop {
-        let bytes_read = file.read(&mut buffer).unwrap_or(0);
-        if bytes_read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..bytes_read]);
+        let n = file.read(&mut buffer)?;
+        if n == 0 { break; }
+        hasher.update(&buffer[..n]);
     }
-    format!("{:x}", hasher.finalize())
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn store_capsule_meta(name: &str, meta: &CapsuleMeta) {
-    let mut index = load_capsule_index();
-    index.insert(name.to_string(), meta.clone());
-    save_capsule_index(&index);
-}
-
-fn load_capsule_meta(name: &str) -> Option<CapsuleMeta> {
-    load_capsule_index().get(name).cloned()
-}
-
-fn remove_capsule_meta(name: &str) {
-    let mut index = load_capsule_index();
-    index.remove(name);
-    save_capsule_index(&index);
-}
-
-fn load_capsule_index() -> HashMap<String, CapsuleMeta> {
-    if let Ok(json) = fs::read_to_string(CAPSULE_INDEX) {
-        serde_json::from_str(&json).unwrap_or_default()
+fn read_index() -> HashMap<String, CapsuleInfo> {
+    if Path::new(CAPSULE_DB).exists() {
+        if let Ok(mut file) = fs::File::open(CAPSULE_DB) {
+            let mut data = String::new();
+            file.read_to_string(&mut data).ok();
+            serde_json::from_str(&data).unwrap_or_default()
+        } else {
+            HashMap::new()
+        }
     } else {
         HashMap::new()
     }
 }
 
-fn save_capsule_index(index: &HashMap<String, CapsuleMeta>) {
-    if let Ok(json) = serde_json::to_string_pretty(index) {
-        let _ = fs::write(CAPSULE_INDEX, json);
+fn rotate_log_if_needed(path: &str) {
+    if let Ok(metadata) = fs::metadata(path) {
+        if metadata.len() > 1024 * 1024 {
+            let _ = fs::rename(path, format!("{}.old", path));
+            println!("[log] rotated log for '{}'.", path);
+        }
     }
 }
 
