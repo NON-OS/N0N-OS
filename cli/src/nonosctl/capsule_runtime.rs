@@ -1,207 +1,221 @@
-// cli/src/nonosctl/capsule_runtime.rs — NØN Capsule Runtime System
+// cli/src/nonosctl/capsule_runtime.rs — Sovereign Capsule Runtime Engine for NØN-OS
 // Maintained by ek@nonos-tech.xyz | © 2025 NØN Technologies
-// Handles lifecycle: deploy, run, verify, logs, info, delete
+// Executes, supervises, signals, and persists sovereign capsules with full process lifecycle control
 
-use std::fs;
 use std::collections::HashMap;
+use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use chrono::Utc;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-const CAPSULE_DB: &str = "/var/nonos/capsules/index.json";
-const CAPSULE_DIR: &str = "/var/nonos/capsules";
-const LOG_DIR: &str = "/var/nonos/capsules/logs";
-const TELEMETRY_DIR: &str = "/var/nonos/capsules/telemetry";
+use crate::logging::log_event;
+use crate::telemetry::log_capsule_telemetry;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct CapsuleInfo {
-    pub api_version: String,
+const RUNTIME_STATE_DIR: &str = "/run/nonos/runtime";
+const EVENT_STREAM_DIR: &str = "/var/nonos/runtime/events";
+const MAX_RESTART_ATTEMPTS: u8 = 5;
+const LOG_ROTATE_SIZE: u64 = 1024 * 1024; // 1MB
+const BACKOFF_BASE: u64 = 5; // seconds
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub enum CapsuleStatus {
+    Launching,
+    Running,
+    Idle,
+    Crashed,
+    Restarting,
+    Terminated,
+    Suspended,
+    Failed,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum CapsuleType {
+    Service,
+    Daemon,
+    Task,
+    ZkMesh,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CapsuleProcess {
     pub name: String,
+    pub pid: u32,
+    pub status: CapsuleStatus,
+    pub start_time: DateTime<Utc>,
     pub path: String,
-    pub deployed_at: String,
-    pub checksum: String,
-    pub mode: String,
-    pub permissions: Vec<String>,
+    pub restart_attempts: u8,
+    pub tags: Vec<String>,
+    pub memory_limit_mb: Option<u64>,
+    pub cpu_limit_pct: Option<u8>,
+    pub env: Option<HashMap<String, String>>,
+    pub capsule_type: CapsuleType,
+    pub log_path: String,
+    pub telemetry_path: String,
+    pub last_error: Option<String>,
+    pub last_crash_at: Option<DateTime<Utc>>,
 }
 
-pub fn deploy_capsule(name: &str, source_path: &str) {
-    let target_path = format!("{}/{}", CAPSULE_DIR, name);
-    let deployed_at = Utc::now().to_rfc3339();
+pub struct CapsuleRuntime {
+    pub active: Arc<Mutex<HashMap<String, CapsuleProcess>>>,
+}
 
-    if !Path::new(source_path).exists() {
-        println!("[capsule] error: source '{}' does not exist.", source_path);
-        return;
-    }
-
-    fs::create_dir_all(LOG_DIR).ok();
-    fs::create_dir_all(TELEMETRY_DIR).ok();
-    fs::copy(source_path, &target_path).expect("[capsule] failed to copy binary");
-
-    let checksum = compute_sha256(&target_path).unwrap_or_else(|_| "<error>".into());
-
-    let mut capsule = CapsuleInfo {
-        api_version: "v2".into(),
-        name: name.into(),
-        path: target_path.clone(),
-        deployed_at,
-        checksum,
-        mode: "SAFE".into(),
-        permissions: vec!["net".into(), "fs".into()],
-    };
-
-    let manifest_path = Path::new(source_path).with_file_name("manifest.toml");
-    if manifest_path.exists() {
-        if let Ok(contents) = fs::read_to_string(manifest_path) {
-            let parsed: toml::Value = toml::from_str(&contents).unwrap_or_default();
-            if let Some(mode) = parsed.get("mode").and_then(|v| v.as_str()) {
-                capsule.mode = mode.into();
-            }
-            if let Some(perms) = parsed.get("permissions").and_then(|v| v.as_array()) {
-                capsule.permissions = perms.iter().filter_map(|p| p.as_str().map(String::from)).collect();
-            }
+impl CapsuleRuntime {
+    pub fn new() -> Self {
+        fs::create_dir_all(RUNTIME_STATE_DIR).ok();
+        fs::create_dir_all(EVENT_STREAM_DIR).ok();
+        CapsuleRuntime {
+            active: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    let mut index = read_index();
-    index.insert(name.into(), capsule.clone());
-    fs::write(CAPSULE_DB, serde_json::to_string_pretty(&index).unwrap()).expect("[capsule] failed to write DB");
-    println!("[capsule] '{}' deployed successfully.", name);
-}
+    pub fn start(&self, name: &str, path: &str, capsule_type: CapsuleType, tags: Vec<String>, env: Option<HashMap<String, String>>) {
+        let mut registry = self.active.lock().unwrap();
+        let log_path = format!("/var/nonos/logs/{}.log", name);
+        let telemetry_path = format!"/var/nonos/telemetry/{}.json", name);
 
-pub fn run_capsule(name: &str) {
-    let index = read_index();
-    if let Some(info) = index.get(name) {
-        println!("[capsule] running '{}'...", name);
-        let log_path = format!("{}/{}.log", LOG_DIR, name);
-        let telemetry_path = format!("{}/{}.json", TELEMETRY_DIR, name);
-
-        if info.mode == "RAW" && cfg!(feature = "safe") {
-            println!("[capsule] execution blocked: '{}' requires RAW mode but system is in SAFE mode.", name);
-            return;
+        let mut command = Command::new(path);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some(ref env_map) = env {
+            for (k, v) in env_map.iter() {
+                command.env(k, v);
+            }
         }
 
-        let start_time = Utc::now();
-        let result = Command::new(&info.path)
-            .env("NONOS_MODE", &info.mode)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
+        match command.spawn() {
+            Ok(mut child) => {
+                let capsule = CapsuleProcess {
+                    name: name.to_string(),
+                    pid: child.id(),
+                    status: CapsuleStatus::Running,
+                    start_time: Utc::now(),
+                    path: path.to_string(),
+                    restart_attempts: 0,
+                    tags,
+                    memory_limit_mb: None,
+                    cpu_limit_pct: None,
+                    env,
+                    capsule_type,
+                    log_path: log_path.clone(),
+                    telemetry_path: telemetry_path.clone(),
+                    last_error: None,
+                    last_crash_at: None,
+                };
 
-        match result {
-            Ok(out) => {
-                fs::write(&log_path, &out.stdout).ok();
-                fs::write(&telemetry_path, serde_json::json!({
-                    "name": name,
-                    "exit_code": out.status.code(),
-                    "ran_at": start_time.to_rfc3339(),
-                    "duration_ms": Utc::now().signed_duration_since(start_time).num_milliseconds()
-                }).to_string()).ok();
-                rotate_log_if_needed(&log_path);
-                println!("[capsule] execution complete.");
+                registry.insert(name.to_string(), capsule.clone());
+                self.persist_state(&capsule);
+                self.emit_event(&capsule.name, "spawned");
+                log_capsule_telemetry(name, capsule.pid as i32, "spawned");
+                log_event("runtime", name, "start", "capsule_runtime.rs", "capsule started");
+                Self::monitor(Arc::clone(&self.active), name.to_string(), child, log_path, telemetry_path);
             },
-            Err(e) => println!("[capsule] error: {}", e),
+            Err(e) => {
+                println!"[runtime] failed to launch '{}': {}", name, e);
+                log_event("runtime", name, "fail", "capsule_runtime.rs", &format!("launch failed: {}", e));
+            },
         }
-    } else {
-        println!("[capsule] '{}' not found.", name);
     }
-}
 
-pub fn verify_capsule(name: &str) {
-    let db = read_index();
-    if let Some(capsule) = db.get(name) {
-        let current = compute_sha256(&capsule.path).unwrap_or_default();
-        if current == capsule.checksum {
-            println!("[verify] ✅ '{}' passed integrity check.", name);
+    fn monitor(rt: Arc<Mutex<HashMap<String, CapsuleProcess>>>, name: String, mut child: Child, log_path: String, telemetry_path: String) {
+        thread::spawn(move || {
+            let output = child.wait_with_output();
+            let mut registry = rt.lock().unwrap();
+            if let Some(capsule) = registry.get_mut(&name) {
+                capsule.status = CapsuleStatus::Terminated;
+                capsule.restart_attempts += 1;
+                capsule.last_crash_at = Some(Utc::now());
+                log_event("runtime", &name, "exit", "capsule_runtime.rs", "capsule exited");
+
+                if let Ok(out) = &output {
+                    fs::write(&log_path, &out.stdout).ok();
+                    fs::write(&telemetry_path, serde_json::json!({
+                        "exit_code": out.status.code(),
+                        "ran_at": Utc::now().to_rfc3339(),
+                        "capsule": name
+                    }).to_string()).ok();
+                }
+
+                if capsule.restart_attempts <= MAX_RESTART_ATTEMPTS {
+                    println!"[runtime] restarting '{}'...", name);
+                    capsule.status = CapsuleStatus::Restarting;
+                    let backoff = Duration::from_secs(BACKOFF_BASE * capsule.restart_attempts as u64);
+                    thread::sleep(backoff);
+                    let cloned = capsule.clone();
+                    drop(registry);
+                    let runtime = CapsuleRuntime::new();
+                    runtime.start(&cloned.name, &cloned.path, cloned.capsule_type.clone(), cloned.tags.clone(), cloned.env.clone());
+                } else {
+                    println!"[runtime] '{}' exceeded restart attempts.", name);
+                    capsule.status = CapsuleStatus::Failed;
+                }
+            }
+        });
+    }
+
+    fn emit_event(&self, name: &str, action: &str) {
+        let file_path = format!("{}/{}_{}.event", EVENT_STREAM_DIR, name, Utc::now().timestamp());
+        let json = serde_json::json!({
+            "name": name,
+            "event": action,
+            "timestamp": Utc::now().to_rfc3339(),
+        });
+        fs::write(file_path, json.to_string()).ok();
+    }
+
+    pub fn list(&self) {
+        let registry = self.active.lock().unwrap();
+        for (name, proc) in registry.iter() {
+            println!"- {} | PID {} | {:?} | {:?}", name, proc.pid, proc.status, proc.start_time);
+        }
+    }
+
+    pub fn kill(&self, name: &str) {
+        let mut registry = self.active.lock().unwrap();
+        if let Some(proc) = registry.remove(name) {
+            let _ = Command::new("kill").arg("-9").arg(proc.pid.to_string()).output();
+            println!"[runtime] '{}' terminated.", name);
+            log_event("runtime", name, "kill", "capsule_runtime.rs", "capsule killed");
+            fs::remove_file(format!("{}/{}.json", RUNTIME_STATE_DIR, name)).ok();
+        }
+    }
+
+    pub fn restart(name: String, path: String, capsule_type: CapsuleType, tags: Vec<String>, env: Option<HashMap<String, String>>) {
+        let runtime = CapsuleRuntime::new();
+        runtime.start(&name, &path, capsule_type, tags, env);
+    }
+
+    fn persist_state(&self, proc: &CapsuleProcess) {
+        let path = format!("{}/{}.json", RUNTIME_STATE_DIR, proc.name);
+        if let Ok(json) = serde_json::to_string_pretty(proc) {
+            fs::write(path, json).ok();
+        }
+    }
+
+    pub fn inspect(&self, name: &str) {
+        let path = format!("{}/{}.json", RUNTIME_STATE_DIR, name);
+        if Path::new(&path).exists() {
+            if let Ok(mut file) = File::open(&path) {
+                let mut content = String::new();
+                file.read_to_string(&mut content).ok();
+                println!"[inspect:{}]\n{}", name, content);
+            }
         } else {
-            println!("[verify] ❌ '{}' checksum mismatch.", name);
+            println!"[runtime] no capsule state found for '{}'.", name);
         }
-    } else {
-        println!("[verify] capsule '{}' not found.", name);
     }
-}
 
-pub fn capsule_info(name: &str, json_out: bool) {
-    let index = read_index();
-    if let Some(info) = index.get(name) {
-        if json_out {
-            println!("{}", serde_json::to_string_pretty(info).unwrap());
-        } else {
-            println!("[capsule] '{}': {:?}", name, info);
-        }
-    } else {
-        println!("[capsule] '{}' not found.", name);
-    }
-}
-
-pub fn list_capsules(json_out: bool) {
-    let index = read_index();
-    if json_out {
-        println!("{}", serde_json::to_string_pretty(&index).unwrap());
-    } else {
-        for (name, info) in index.iter() {
-            println!("- {} [{}]", name, info.mode);
+    pub fn rotate_log(path: &str) {
+        if let Ok(metadata) = fs::metadata(path) {
+            if metadata.len() > LOG_ROTATE_SIZE {
+                let _ = fs::rename(path, format!("{}.old", path));
+                println!"[runtime] rotated log for '{}'.", path);
+            }
         }
     }
 }
-
-pub fn capsule_logs(name: &str) {
-    let log_path = format!("{}/{}.log", LOG_DIR, name);
-    if Path::new(&log_path).exists() {
-        let content = fs::read_to_string(log_path).unwrap_or_default();
-        println!("[logs:{}]\n{}", name, content);
-    } else {
-        println!("[capsule] no logs found for '{}'.", name);
-    }
-}
-
-pub fn delete_capsule(name: &str) {
-    let mut index = read_index();
-    if let Some(info) = index.remove(name) {
-        fs::remove_file(&info.path).ok();
-        fs::remove_file(format!("{}/{}.log", LOG_DIR, name)).ok();
-        fs::remove_file(format!("{}/{}.json", TELEMETRY_DIR, name)).ok();
-        let _ = fs::write(CAPSULE_DB, serde_json::to_string_pretty(&index).unwrap());
-        println!("[capsule] '{}' deleted.", name);
-    } else {
-        println!("[capsule] '{}' not found.", name);
-    }
-}
-
-fn compute_sha256(path: &str) -> Result<String, std::io::Error> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 4096];
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 { break; }
-        hasher.update(&buffer[..n]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn read_index() -> HashMap<String, CapsuleInfo> {
-    if Path::new(CAPSULE_DB).exists() {
-        if let Ok(mut file) = fs::File::open(CAPSULE_DB) {
-            let mut data = String::new();
-            file.read_to_string(&mut data).ok();
-            serde_json::from_str(&data).unwrap_or_default()
-        } else {
-            HashMap::new()
-        }
-    } else {
-        HashMap::new()
-    }
-}
-
-fn rotate_log_if_needed(path: &str) {
-    if let Ok(metadata) = fs::metadata(path) {
-        if metadata.len() > 1024 * 1024 {
-            let _ = fs::rename(path, format!("{}.old", path));
-            println!("[log] rotated log for '{}'.", path);
-        }
-    }
-}
-
