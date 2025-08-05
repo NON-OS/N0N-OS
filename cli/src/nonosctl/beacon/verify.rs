@@ -1,19 +1,23 @@
-// cli/src/nonosctl/beacon/verify.rs — Proof Engine for zk and Signature Auth
+// cli/src/nonosctl/beacon/verify.rs — Sovereign Proof Validation Layer
 // Maintained by ek@nonos-tech.xyz | © 2025 NØN Technologies
-// Verifies: (1) capsule zkProofs, (2) gossip signature chain, (3) author binding to manifest
+// Verifies: (1) Capsule zkProofs, (2) Gossip Signature Chains, (3) Author Bindings, (4) Revocation & Expiry Logic
 
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use sha2::{Digest, Sha256};
 use serde::{Serialize, Deserialize};
 
+use crate::logging::{log_event, LogKind, LogMeta};
+
 const ZK_CACHE_PATH: &str = "/var/nonos/auth/zk_verified.json";
 const MANIFEST_DIR: &str = "/var/nonos/capsules";
 const CAPSULE_SIG_DB: &str = "/var/nonos/auth/sig_cache.json";
+const REVOKED_DB: &str = "/var/nonos/auth/revoked.json";
+const ZK_EXPIRY_DAYS: i64 = 10;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ZkVerifiedCapsule {
@@ -21,6 +25,9 @@ pub struct ZkVerifiedCapsule {
     pub verified_at: String,
     pub signature: String,
     pub zk_hash: String,
+    pub author_pubkey: String,
+    pub expires_at: Option<String>,
+    pub permanent: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,24 +64,41 @@ pub fn verify_zk_hash(capsule: &str, zk_hash: &str) -> bool {
     false
 }
 
-pub fn validate_capsule(capsule: &str, sig: &CapsuleSig, zk_hash: &str) -> bool {
+pub fn validate_capsule(capsule: &str, sig: &CapsuleSig, zk_hash: &str, permanent: bool) -> bool {
+    if is_revoked(&sig.pubkey) {
+        log_event("verify", capsule, "rejected", "verify.rs", "capsule pubkey revoked");
+        return false;
+    }
+
     let sig_ok = verify_identity(&sig.pubkey, &sig.signature, &sig.message);
     let zk_ok = verify_zk_hash(capsule, zk_hash);
 
     if sig_ok && zk_ok {
-        cache_verified_capsule(capsule, &sig.signature, zk_hash);
+        cache_verified_capsule(capsule, &sig.signature, zk_hash, &sig.pubkey, permanent);
+        log_event("verify", capsule, "verified", "verify.rs", "zk and sig verified");
         true
     } else {
+        log_event("verify", capsule, "fail", "verify.rs", "verification failure");
         false
     }
 }
 
-fn cache_verified_capsule(capsule: &str, signature: &str, zk_hash: &str) {
+fn cache_verified_capsule(capsule: &str, signature: &str, zk_hash: &str, pubkey: &str, permanent: bool) {
+    let now = Utc::now();
+    let expiry = if permanent {
+        None
+    } else {
+        Some((now + chrono::Duration::days(ZK_EXPIRY_DAYS)).to_rfc3339())
+    };
+
     let verified = ZkVerifiedCapsule {
         capsule: capsule.to_string(),
-        verified_at: Utc::now().to_rfc3339(),
+        verified_at: now.to_rfc3339(),
         signature: signature.into(),
         zk_hash: zk_hash.into(),
+        author_pubkey: pubkey.into(),
+        expires_at: expiry,
+        permanent,
     };
 
     let path = Path::new(ZK_CACHE_PATH);
@@ -108,6 +132,17 @@ pub fn check_manifest_identity(capsule: &str, expected_pubkey: &str) -> bool {
     if Path::new(&path).exists() {
         if let Ok(contents) = fs::read_to_string(path) {
             return contents.contains(&format!("author = \"{}\"", expected_pubkey));
+        }
+    }
+    false
+}
+
+pub fn is_revoked(pubkey: &str) -> bool {
+    let path = Path::new(REVOKED_DB);
+    if path.exists() {
+        if let Ok(data) = fs::read_to_string(path) {
+            let revoked_list: Vec<String> = serde_json::from_str(&data).unwrap_or_default();
+            return revoked_list.contains(&pubkey.to_string());
         }
     }
     false
