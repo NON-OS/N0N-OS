@@ -1,0 +1,50 @@
+[package]
+name = "nonos-tui"
+version = "0.1.0"
+edition = "2021"
+description = "NØN-OS Sovereign Terminal Interface (zK-native)"
+authors = ["ek@nonos-tech.xyz"]
+license = "MIT"
+repository = "https://github.com/nonos-tech/N0N-OS"
+keywords = ["sovereign", "zkproof", "terminal", "nonos"]
+categories = ["command-line-utilities", "privacy", "system-tools"]
+
+[dependencies]
+# TUI rendering stack
+ratatui = "0.26"
+crossterm = "0.27"
+
+# Async runtime and channels
+tokio = { version = "1.38", features = ["full"] }
+
+# Data and state serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Time and logging
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+simplelog = "0.12"
+
+# Cryptographic stack (zk & sigs)
+ed25519-dalek = "1.0"
+sha2 = "0.10"
+bs58 = "0.5"
+hex = "0.4"
+
+# Zero-knowledge placeholder — to plug proof systems
+bellperson = { version = "0.26", optional = true }
+zexe = { version = "0.9", optional = true }
+
+# File + path helpers
+dirs = "5.0"
+walkdir = "2.5"
+
+# Nonosctl runtime interface (optional local crate)
+nonosctl = { path = "../cli", optional = true }
+
+[features]
+default = []
+zk = ["bellperson", "zexe"]
+
