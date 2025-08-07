@@ -1,154 +1,238 @@
-# NØNOS OS
-
-<div align="center">
-
-> **The Trustless Operating System**  
-> Zero-state. Cryptographic. Terminal-native. Built from scratch.
+# N0N-OS: The Trustless Operating System
 
 ```
- ███╗   ██╗ ██████╗  ███╗   ██╗ ██████╗ ███████╗
- ████╗  ██║██╔═══██╗████╗  ██║██╔═══██╗██╔════╝
- ██╔██╗ ██║██║   ██║██╔██╗ ██║██║   ██║███████╗
- ██║╚██╗██║██║   ██║██║╚██╗██║██║   ██║╚════██║
- ██║ ╚████║╚██████╔╝██║ ╚████║╚██████╔╝███████║
- ╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝ ╚══════╝
+███╗   ██╗ ██████╗ ███╗   ██╗       ██████╗ ███████╗
+████╗  ██║██╔═══██╗████╗  ██║      ██╔═══██╗██╔════╝
+██╔██╗ ██║██║   ██║██╔██╗ ██║█████╗██║   ██║███████╗
+██║╚██╗██║██║   ██║██║╚██╗██║╚════╝██║   ██║╚════██║
+██║ ╚████║╚██████╔╝██║ ╚████║      ╚██████╔╝███████║
+╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═══╝       ╚═════╝ ╚══════╝
 ```
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/nonos-dev/nonos)
-[![License](https://img.shields.io/badge/license-TBD-blue)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-nightly-orange)](https://rustup.rs/)
-[![Architecture](https://img.shields.io/badge/arch-x86__64-lightgrey)](https://github.com/nonos-dev/nonos)
+**Zero-state. Cryptographic. Terminal-native. Built from scratch.**
 
-</div>
+## Overview
 
----
+N0N-OS is a revolutionary operating system built on the principle that execution is proof, not trust. Developed in Rust, it operates entirely in memory with cryptographic verification at every layer, providing a secure, stateless computing environment.
 
-## 🚀 What is NØN-OS?
-
-**NØN-OS** is a revolutionary operating system where **execution is proof**, not trust. Built from scratch in Rust, it operates entirely in memory with cryptographic verification at every layer.
-
-Unlike traditional operating systems, NØN-OS:
-- 🔒 **Runs entirely from RAM** - No persistent state, no filesystem corruption
-- 🔐 **Cryptographically verifies everything** - Every module signed with ed25519
-- 🛡️ **Enforces capability-based security** - Syscalls require cryptographic tokens
-- ⚡ **Boots directly from UEFI** - No legacy GRUB dependencies
-- 🦀 **Memory-safe by design** - Written in Rust with zero unsafe blocks
-
----
-
-## ✨ Key Features
-
-<table>
-<tr>
-<td width="50%">
-
-### 🔐 **Cryptographic Security**
-- ed25519 + blake3 primitives
-- Signed module execution
-- Capability-based syscalls
-- Zero-trust architecture
-
-</td>
-<td width="50%">
-
-### ⚡ **Zero-State Design**
-- Diskless operation
-- RAM-resident kernel
-- No persistent identity
-- Stateless execution model
-
-</td>
-</tr>
-<tr>
-<td width="50%">
-
-### 🛡️ **Isolation & Sandboxing**
-- Module-level sandboxing
-- Cryptographic vault system
-- Secure inter-module IPC
-- Memory-safe Rust kernel
-
-</td>
-<td width="50%">
-
-### 🌐 **Future-Ready**
-- zkAuth identity system
-- Decentralized relay mesh
-- Anyone SDK integration
-- Privacy-first coordination
-
-</td>
-</tr>
-</table>
-
----
-
-## 🏗️ Architecture Overview
-
-```mermaid
-graph TB
-    A[UEFI Bootloader] --> B[Kernel Bootstrap]
-    B --> C[Memory Management]
-    B --> D[Cryptographic Vault]
-    B --> E[Module Registry]
-    
-    C --> F[Paging System]
-    C --> G[Heap Allocator]
-    
-    D --> H[ed25519 Verification]
-    D --> I[Capability Tokens]
-    
-    E --> J[Module Loader]
-    E --> K[Sandbox Manager]
-    
-    F --> L[Syscall Dispatcher]
-    G --> L
-    I --> L
-    J --> L
-    K --> L
-    
-    L --> M[Runtime Modules]
-```
-
-### Core Principles
+## Core Principles
 
 | Principle | Implementation |
 |-----------|----------------|
-| **Zero-State** | All runtime state in memory, no persistent writes |
-| **Cryptographic Boot** | Every module verified via ed25519 signatures |
-| **Capability Isolation** | Syscalls bound to cryptographic tokens |
-| **Memory Safety** | Pure Rust kernel with no unsafe blocks |
-| **Modular Runtime** | Sandboxed `.mod` binaries with scoped access |
+| Zero-State | All runtime state in memory, no persistent writes |
+| Cryptographic Boot | Every module verified via ed25519 signatures |
+| Capability Isolation | Syscalls bound to cryptographic tokens |
+| Memory Safety | Pure Rust kernel with no unsafe blocks |
+| Modular Runtime | Sandboxed .mod binaries with scoped access |
 
----
+## System Architecture
 
-## 📁 Project Structure
+```
+graph TB
+  A[UEFI Bootloader] --> B[Kernel Bootstrap]
+  B --> C[Memory Management]
+  B --> D[Cryptographic Vault]
+  B --> E[Module Registry]
+  C --> F[Paging System]
+  C --> G[Heap Allocator]
+  D --> H[ed25519 Verification]
+  D --> I[Capability Tokens]
+  E --> J[Module Loader]
+  E --> K[Sandbox Manager]
+  F --> L[Syscall Dispatcher]
+  G --> L
+  I --> L
+  J --> L
+  K --> L
+  L --> M[Runtime Modules]
+```
+
+## Trustless Boot Chain
+
+```
+sequenceDiagram
+  participant UEFI
+  participant Bootloader
+  participant Kernel
+  participant Vault
+  participant Module
+  
+  UEFI->>Bootloader: Execute BOOTX64.EFI
+  Bootloader->>Kernel: Initialize & jump to _start()
+  Kernel->>Kernel: Setup paging, heap, IDT
+  Kernel->>Vault: Initialize entropy & keys
+  Kernel->>Module: Load .mod binary
+  Module->>Vault: Request verification
+  Vault->>Vault: Verify ed25519 signature
+  Vault->>Module: Issue capability token
+  Module->>Kernel: Execute with token
+```
+
+## Current Project Status
+
+N0N-OS is under active development with a target release in September 2025. The current implementation includes:
+
+- UEFI bootloader
+- Core kernel architecture
+- Memory management system
+- Cryptographic verification framework
+- Module system and capability enforcement (in progress)
+- CLI interface (in progress)
+
+## Project Structure
 
 ```
 N0N-OS/
-├── 🥾 boot/              # UEFI Rust bootloader
-├── 🧠 kernel/            # Core kernel implementation
-│   ├── arch/            # Architecture-specific code (GDT, IDT, VGA)
-│   ├── crypto/          # Cryptographic primitives & vault
-│   ├── memory/          # Memory management (paging, heap, frames)
-│   ├── modules/         # Module loading & sandboxing
-│   ├── runtime/         # Zero-state module tracking
-│   ├── sched/           # Task scheduling & execution
-│   ├── syscall/         # Syscall dispatch & capabilities
-│   ├── ipc/             # Secure inter-module communication
-│   └── lib.rs           # Kernel entry point
-├── 🛠️ cli/               # nonosctl management interface
-├── 📦 shared/            # Shared types & utilities
-├── 📚 docs/              # Documentation & specifications
-└── ⚙️ x86_64-nonos.json  # Custom Rust target specification
+├── boot/           # UEFI Rust bootloader
+├── kernel/         # Core kernel implementation
+│   ├── arch/       # Architecture-specific code (GDT, IDT, VGA)
+│   ├── crypto/     # Cryptographic primitives & vault
+│   ├── memory/     # Memory management (paging, heap, frames)
+│   ├── modules/    # Module loading & sandboxing
+│   ├── runtime/    # Zero-state module tracking
+│   ├── sched/      # Task scheduling & execution
+│   ├── syscall/    # Syscall dispatch & capabilities
+│   ├── ipc/        # Secure inter-module communication
+│   └── lib.rs      # Kernel entry point
+├── cli/            # nonosctl management interface
+├── shared/         # Shared types & utilities
+├── gui/            # Graphical interface components
+├── modules/        # Core system modules
+└── tui/            # Terminal user interface
 ```
 
----
+## Advanced Architecture Details
 
-## 🚀 Quick Start (SOON) TBA
+### Memory Management Hierarchy
+
+```
+graph TB
+  A[Physical Memory Manager] --> B[Frame Allocator]
+  A --> C[Virtual Memory Manager]
+  B --> D[Heap Allocator]
+  C --> E[Page Tables]
+  D --> F[Module Memory Regions]
+  E --> G[Memory Protection]
+  F --> H[Garbage Collection]
+  G --> I[Capability-Based Access]
+  H --> I
+  I --> J[Memory-Safe Runtime]
+```
+
+### Cryptographic Verification Pipeline
+
+```
+graph LR
+  A[Module Binary] --> B[Extract Manifest]
+  B --> C[Verify Hash]
+  C --> D[Verify Signature]
+  D --> E[Check Required Capabilities]
+  E --> F[Issue Capability Tokens]
+  F --> G[Load Into Memory]
+  G --> H[Execute Module]
+```
+
+## Roadmap to September 2025 Release
+
+### Phase 1: Core System Completion (August 2025)
+- Finalize memory management system
+- Complete cryptographic verification pipeline
+- Implement capability token system
+- Stabilize module loading and execution
+- Comprehensive kernel testing
+
+### Phase 2: User Interface & Experience (Early September 2025)
+- Complete TUI implementation
+- Finalize CLI tools and utilities
+- Basic GUI framework
+- User documentation
+- Installation and setup scripts
+
+### Phase 3: Module Ecosystem (Mid-September 2025)
+- Core system modules
+- Developer SDK for module creation
+- Module repository and verification system
+- Inter-module communication framework
+- Example applications
+
+### Phase 4: Release & Distribution (Late September 2025)
+- Performance optimization
+- Security auditing
+- Hardware compatibility testing
+- Installation media creation
+- Public release and documentation
+
+## Security Model
+
+N0N-OS implements a trustless security model where:
+
+1. Every component is cryptographically verified before execution
+2. System resources are accessed only through capability tokens
+3. Modules operate in isolated sandboxes with minimal permissions
+4. All operations are memory-safe by design
+5. No persistent state means no persistent attack surface
+
+## Technical Specifications
+
+### Cryptographic Primitives
+- Ed25519 for digital signatures
+- BLAKE3 for high-performance hashing
+- ChaCha20-Poly1305 for authenticated encryption
+
+### Memory Management
+- Zero-copy architecture
+- Capability-based memory access
+- Strict isolation between modules
+
+### Performance Metrics
+| Metric | Value | Comparison |
+|--------|-------|------------|
+| Boot Time | ~200ms | 10x faster than Linux |
+| Memory Footprint | ~8MB | 100x smaller than Windows |
+| Syscall Latency | ~50ns | Comparable to L4 microkernel |
+| Module Load Time | ~1ms | Including signature verification |
+| Context Switch | ~20ns | Hardware-assisted switching |
+
+## Module Development
+
+Modules in N0N-OS are self-contained units with explicit capability requirements:
+
+```rust
+#[derive(Serialize, Deserialize)]
+pub struct ModuleManifest {
+    pub name: String,
+    pub version: String,
+    pub hash: Blake3Hash,
+    pub required_caps: Vec<Capability>,
+    pub signature: Ed25519Signature,
+}
+```
+
+Each module must declare its required capabilities and be cryptographically signed before execution.
+
+## Capability System
+
+```rust
+pub enum Capability {
+    CoreExec,    // Basic execution rights
+    IO,          // Input/output operations
+    Network,     // Network access
+    IPC,         // Inter-process communication
+    Memory,      // Memory allocation
+    Crypto,      // Cryptographic operations
+}
+
+pub struct CapabilityToken {
+    pub owner_module: ModuleId,
+    pub permissions: Vec<Capability>,
+    pub expires_at: Option<Timestamp>,
+    pub signature: Ed25519Signature,
+}
+```
+
+## Development Environment
 
 ### Prerequisites
-
 ```bash
 # Install Rust nightly
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -160,16 +244,13 @@ cargo install bootimage
 # Install QEMU for testing
 # Ubuntu/Debian:
 sudo apt install qemu-system-x86
-
 # macOS:
 brew install qemu
-
 # Arch Linux:
 sudo pacman -S qemu
 ```
 
-### Build & Run (SOON) TBA
-
+### Building & Running (Coming Soon)
 ```bash
 # Clone the repository
 git clone https://github.com/nonos-dev/nonos.git
@@ -186,280 +267,29 @@ qemu-system-x86_64 \
   -serial stdio
 ```
 
-### Creating Bootable USB
+## Contributing
 
-```bash
-# Build UEFI image
-cd boot
-cargo build --release
+We welcome contributions to N0N-OS. If you're interested in participating:
 
-# Flash to USB (replace /dev/sdX with your USB device)
-sudo dd if=target/x86_64-unknown-uefi/release/nonos-boot.efi of=/dev/sdX bs=1M
-```
+1. Fork the repository
+2. Create a feature branch
+3. Submit a pull request with your changes
 
----
+Please ensure your code follows our style guidelines:
 
-## 🔐 Security Model
-
-### Trustless Boot Chain
-
-```mermaid
-sequenceDiagram
-    participant UEFI
-    participant Bootloader
-    participant Kernel
-    participant Vault
-    participant Module
-    
-    UEFI->>Bootloader: Execute BOOTX64.EFI
-    Bootloader->>Kernel: Initialize & jump to _start()
-    Kernel->>Kernel: Setup paging, heap, IDT
-    Kernel->>Vault: Initialize entropy & keys
-    Kernel->>Module: Load .mod binary
-    Module->>Vault: Request verification
-    Vault->>Vault: Verify ed25519 signature
-    Vault->>Module: Issue capability token
-    Module->>Kernel: Execute with token
-```
-
-### Module Manifest Format
-
-Every `.mod` binary includes a cryptographically signed manifest:
-
-```rust
-#[derive(Serialize, Deserialize)]
-pub struct ModuleManifest {
-    pub name: String,
-    pub version: String,
-    pub hash: Blake3Hash,
-    pub required_caps: Vec<Capability>,
-    pub signature: Ed25519Signature,
-}
-```
-
-### Capability System
-
-```rust
-pub enum Capability {
-    CoreExec,     // Basic execution rights
-    IO,           // Input/output operations
-    Network,      // Network access
-    IPC,          // Inter-process communication
-    Memory,       // Memory allocation
-    Crypto,       // Cryptographic operations
-}
-
-pub struct CapabilityToken {
-    pub owner_module: ModuleId,
-    pub permissions: Vec<Capability>,
-    pub expires_at: Option<Timestamp>,
-    pub signature: Ed25519Signature,
-}
-```
-
----
-
-## 🧩 Module Development
-
-### Creating a Module
-
-```rust
-// src/lib.rs
-#![no_std]
-#![no_main]
-
-use nonos_shared::{ModuleManifest, Capability};
-
-#[no_mangle]
-pub extern "C" fn module_main() -> i32 {
-    // Your module code here
-    nonos_syscall::log("Hello from secure module!");
-    0
-}
-
-#[no_mangle]
-pub static MODULE_MANIFEST: ModuleManifest = ModuleManifest {
-    name: "hello_world",
-    version: "1.0.0",
-    hash: blake3::hash(include_bytes!("../target/hello_world.bin")),
-    required_caps: &[Capability::CoreExec, Capability::IO],
-    signature: include!("../signature.rs"), // Generated by signing tool
-};
-```
-
-### Building & Signing
-
-```bash
-# Build module
-cargo build --target x86_64-nonos --release
-
-# Sign module (requires private key)
-nonosctl sign target/x86_64-nonos/release/hello_world.mod
-
-# Verify signature
-nonosctl verify hello_world.mod
-```
-
----
-
-## 🛠️ Development Tools
-
-### nonosctl CLI
-
-```bash
-# Module management
-nonosctl build <module>          # Build a module
-nonosctl sign <module>           # Sign a module
-nonosctl verify <module>         # Verify module signature
-nonosctl deploy <module>         # Deploy to running system
-
-# System management
-nonosctl status                  # Show system status
-nonosctl modules                 # List loaded modules
-nonosctl capabilities <module>   # Show module capabilities
-nonosctl logs                    # View system logs
-
-# Development
-nonosctl new <module>            # Create new module template
-nonosctl test <module>           # Run module tests
-nonosctl debug <module>          # Debug module in QEMU
-```
-
-### Debugging
-
-```bash
-# Run with GDB support
-qemu-system-x86_64 \
-  -drive format=raw,file=bootimage-nonos_kernel.bin \
-  -s -S
-
-# In another terminal
-gdb target/x86_64-nonos/debug/nonos_kernel
-(gdb) target remote :1234
-(gdb) continue
-```
-
----
-
-## 📊 Performance & Benchmarks
-
-| Metric | Value | Comparison |
-|--------|-------|------------|
-| Boot Time | ~200ms | 10x faster than Linux |
-| Memory Footprint | ~8MB | 100x smaller than Windows |
-| Syscall Latency | ~50ns | Comparable to L4 microkernel |
-| Module Load Time | ~1ms | Including signature verification |
-| Context Switch | ~20ns | Hardware-assisted switching |
-
----
-
-## 🗺️ Roadmap
-
-### Phase 1: Core System ✅
-- [x] UEFI bootloader
-- [x] Memory management
-- [x] Cryptographic vault
-- [x] Module system
-- [x] Capability enforcement
-
-### Phase 2: Runtime & IPC 🚧
-- [x] Module registry
-- [x] Secure IPC channels
-- [ ] Advanced scheduling
-- [ ] Performance optimization
-- [ ] Comprehensive testing
-
-### Phase 3: Network & Distribution 🔜
-- [ ] Anyone SDK integration
-- [ ] Decentralized relay mesh
-- [ ] zkAuth identity system
-- [ ] Permissionless module registry
-- [ ] Micropayment integration
-
-### Phase 4: Ecosystem 🔮
-- [ ] Development IDE
-- [ ] Package manager
-- [ ] Standard library modules
-- [ ] Hardware abstraction layer
-- [ ] Multi-architecture support
-
----
-
-## 🤝 Contributing
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
-
-### Development Setup
-
-```bash
-# Fork and clone
-git clone https://github.com/yourusername/nonos.git
-cd nonos
-
-# Install development dependencies
-rustup component add rust-src
-cargo install cargo-xbuild bootimage
-
-# Run tests
-cargo test
-
-# Format code
-cargo fmt
-
-# Check for issues
-cargo clippy
-```
-
-### Code Style
-
-- Follow Rust standard formatting (`cargo fmt`)
-- No `unsafe` blocks in kernel code
+- Follow Rust standard formatting (cargo fmt)
+- No unsafe blocks in kernel code
 - Comprehensive documentation for public APIs
 - Unit tests for all critical functionality
 
----
+## License
 
-## 📚 Documentation
-
-- 📖 [Architecture Overview](docs/architecture.md)
-- 🔐 [Security Model](docs/security.md)
-- 🧩 [Module Development](docs/modules.md)
-- 🔧 [Syscall Reference](docs/syscalls.md)
-- 🏗️ [Build System](docs/building.md)
-- 🐛 [Debugging Guide](docs/debugging.md)
+License details will be finalized before the September 2025 release.
 
 ---
 
-## 🌟 Community
+Built by the N0N-OS team. You own what you compute.
 
-- 💬 [Telegram](https://t.me/nonosPortal)
-- 🐦 [Twitter](https://twitter.com/nonos_eth)
-- 📧 [Mailing List](mailto:team@nonos.site)
-- 🌐 [Website](https://nonos-tech.xyz)
+By eK@nonos-tech.xyz 
 
----
-
-## 📄 License
-
-**License: TBD**
-
-> You own what you compute.
-
----
-
-## 🙏 Acknowledgments
-
-- Built by **eK-core@nonos.dev**
-- Maintained by **nonos-tech.xyz**
-- Tested on QEMU, USB, and real hardware
-- Inspired by the principles of trustless computing
-
----
-
-<div align="center">
-
-**[⬆ Back to Top](#nønos-os)**
-
-Made with ❤️ and 🦀 by the NØN-OS team
-
-</div>
+https://nonos-tech.xyz
