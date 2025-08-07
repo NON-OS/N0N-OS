@@ -27,7 +27,7 @@ N0N-OS is a revolutionary operating system built on the principle that execution
 
 ## System Architecture
 
-```
+```mermaid
 graph TB
   A[UEFI Bootloader] --> B[Kernel Bootstrap]
   B --> C[Memory Management]
@@ -49,7 +49,7 @@ graph TB
 
 ## Trustless Boot Chain
 
-```
+```mermaid
 sequenceDiagram
   participant UEFI
   participant Bootloader
@@ -101,11 +101,24 @@ N0N-OS/
 └── tui/            # Terminal user interface
 ```
 
-## Advanced Architecture Details
+## Development Roadmap
 
-### Memory Management Hierarchy
+| Component | Priority | Status | Description |
+|-----------|----------|--------|-------------|
+| Nanos-TUI Full Reorg | HIGH | In Progress | Complete redesign as standalone crate with animated terminal snapshots |
+| Decentralized Package Registry | HIGH | Planning | Module synchronization over mesh network with zero-knowledge state verification |
+| Full zkSession Handler | MEDIUM | Planning | Implementation of proof-persistence across system reboots |
+| Filesystem Isolation | MEDIUM | In Progress | Memory-only filesystem with enhanced syscall filter flags |
+| Full Runtime Test Suite | HIGH | Not Started | End-to-end capsule lifecycle testing from spawn through crash to reboot |
+| Syscall/Kernel Isolation | HIGH | In Progress | Validation of neft/user isolation within capsule crash scenarios |
+| ZK Integration Logs (zkKids) | MEDIUM | Not Started | Implementation of graph audit state for cryptographic verification |
+| Module Builder Toolchain | MEDIUM | Planning | CLI tool for automated building and verification of .wad files |
+| Remote Mesh Bootstrap | MEDIUM | Not Started | Peer handshake and key rotation auditability implementation |
+| User Docs + SDK | MEDIUM | Not Started | Comprehensive documentation for .wad capsule development, publishing, verification, and testing |
 
-```
+## Memory Management Hierarchy
+
+```mermaid
 graph TB
   A[Physical Memory Manager] --> B[Frame Allocator]
   A --> C[Virtual Memory Manager]
@@ -119,9 +132,9 @@ graph TB
   I --> J[Memory-Safe Runtime]
 ```
 
-### Cryptographic Verification Pipeline
+## Cryptographic Verification Pipeline
 
-```
+```mermaid
 graph LR
   A[Module Binary] --> B[Extract Manifest]
   B --> C[Verify Hash]
@@ -132,35 +145,42 @@ graph LR
   G --> H[Execute Module]
 ```
 
-## Roadmap to September 2025 Release
+## Release Timeline (September 2025)
 
-### Phase 1: Core System Completion (August 2025)
+### Phase 1: Core System Completion (Early August)
 - Finalize memory management system
 - Complete cryptographic verification pipeline
 - Implement capability token system
 - Stabilize module loading and execution
 - Comprehensive kernel testing
 
-### Phase 2: User Interface & Experience (Early September 2025)
-- Complete TUI implementation
+### Phase 2: User Interface & Experience (Mid-August)
+- Complete TUI implementation with animated terminal interface
 - Finalize CLI tools and utilities
 - Basic GUI framework
 - User documentation
 - Installation and setup scripts
 
-### Phase 3: Module Ecosystem (Mid-September 2025)
+### Phase 3: Module Ecosystem (Late August)
 - Core system modules
 - Developer SDK for module creation
 - Module repository and verification system
 - Inter-module communication framework
 - Example applications
 
-### Phase 4: Release & Distribution (Late September 2025)
+### Phase 4: Security & Testing (Early September)
+- Full runtime test suite implementation
+- Syscall/kernel isolation validation
+- ZK integration logs implementation
+- Remote mesh bootstrap security audit
 - Performance optimization
-- Security auditing
+
+### Phase 5: Release & Distribution (Mid-September)
+- Final security auditing
 - Hardware compatibility testing
 - Installation media creation
-- Public release and documentation
+- User documentation completion
+- Public release
 
 ## Security Model
 
@@ -178,6 +198,7 @@ N0N-OS implements a trustless security model where:
 - Ed25519 for digital signatures
 - BLAKE3 for high-performance hashing
 - ChaCha20-Poly1305 for authenticated encryption
+- Zero-knowledge proofs for state verification
 
 ### Memory Management
 - Zero-copy architecture
@@ -276,7 +297,6 @@ We welcome contributions to N0N-OS. If you're interested in participating:
 3. Submit a pull request with your changes
 
 Please ensure your code follows our style guidelines:
-
 - Follow Rust standard formatting (cargo fmt)
 - No unsafe blocks in kernel code
 - Comprehensive documentation for public APIs
