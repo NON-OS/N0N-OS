@@ -1,0 +1,4 @@
+higher_half = "0xffff_8000_0000_0000"
+heap_min_bytes = 2097152
+guard_page_bytes = 4096
+stack_guard_bytes = 4096
