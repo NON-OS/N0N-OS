@@ -57,8 +57,8 @@ runner = "../scripts/run-qemu-cargo.sh"
 [env]
 # deterministic build metadata; strip local paths from DWARF when enabled
 # RUSTFLAGS = "--remap-path-prefix=$CARGO_MANIFEST_DIR=nonos://kernel"
-# flip this to 0 in CI to disable the runner script behavior if needed
-NONOS_RUNNER := "1"
+# flip this to 0 in CI to disable the runner
+NONOS_RUNNER = "1"
 
 [alias]
 b  = "build"
