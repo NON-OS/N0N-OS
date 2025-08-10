@@ -1,0 +1,6 @@
+[bits]
+LOG   = 1
+YIELD = 2
+TIME  = 4
+IPC   = 8
+KSTAT = 16
