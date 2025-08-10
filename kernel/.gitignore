@@ -1,0 +1,16 @@
+/target
+**/*.swp
+**/*.swo
+**/.DS_Store
+*.img
+*.iso
+*.bin
+*.map
+*.dSYM/
+/esp
+/EFI
+/.cargo/.rustc_info.json
+# node/yarn leftovers (if tools run in repo root)
+node_modules/
+pnpm-lock.yaml
+yarn.lock
