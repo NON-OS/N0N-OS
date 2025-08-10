@@ -1,0 +1,15 @@
+version = 0
+
+[numbers]
+LOG_WRITE = 1
+YIELD     = 2
+TIME_NOW  = 3
+KSTAT_READ= 5
+
+[errors]
+EPERM  = -1
+ENOSYS = -2
+EINVAL = -3
+ENOMEM = -4
+ETIMEDOUT = -5
+EFAULT = -6
