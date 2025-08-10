@@ -1,2 +1,68 @@
+# ─────────────────────────────────────────────────────────────────────
+# NØNOS Cargo configuration (kernel/.cargo/config.toml) 
+# - Bare-metal x86_64 with custom target JSON
+# - Nightly build-std for core/alloc (no_std)
+# - rust-lld, no-redzone, force frame pointers, tiny & auditable codegen
+# - QEMU runner wired to `cargo run`
+# ─────────────────────────────────────────────────────────────────────
+
 [build]
 target = "x86_64-nonos.json"
+
+[unstable]
+build-std = ["core", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.x86_64-nonos.json]
+rustflags = [
+  "-C","panic=abort",
+  "-C","relocation-model=static",
+  "-C","code-model=kernel",
+  "-C","lto=fat",
+  "-C","embed-bitcode=yes",
+  "-C","codegen-units=1",
+  "-C","force-frame-pointers=yes",
+  "-C","no-redzone=yes",
+  "-C","symbol-mangling-version=v0",
+  "-C","opt-level=z",
+  "-Z","function-sections",
+  "-Z","separate-codegen-units",
+  "-Z","emit-stack-sizes",
+  "-C","link-arg=-nostdlib",
+  "-C","link-arg=-nostartfiles",
+  "-C","link-arg=-static",
+  # harden linker output; harmless on bare metal, useful under ELF tooling
+  "-C","link-arg=-z,relro",
+  "-C","link-arg=-z,now",
+]
+
+# extra checks in debug builds (no cost in release)
+[target.'cfg(debug_assertions)']
+rustflags = [
+  "-Z","panic-abort-tests",
+  "-Z","trap-unreachable=yes",
+  "-C","overflow-checks=y",
+  "-C","debug-assertions=y",
+  "-C","debuginfo=1",
+  # keep sections split even in dev for W^X audits
+  "-Z","function-sections",
+]
+
+[target.'cfg(all())']
+linker = "rust-lld"
+
+# cargo run -> package ESP + boot QEMU/OVMF (script lives in ../scripts/)
+runner = "../scripts/run-qemu-cargo.sh"
+
+[env]
+# deterministic build metadata; strip local paths from DWARF when enabled
+# RUSTFLAGS = "--remap-path-prefix=$CARGO_MANIFEST_DIR=nonos://kernel"
+# flip this to 0 in CI to disable the runner script behavior if needed
+NONOS_RUNNER := "1"
+
+[alias]
+b  = "build"
+br = "build --release"
+r  = "run"
+rr = "run --release"
+ck = "check"
