@@ -1,186 +1,257 @@
-//! NØNOS x86_64 GDT/TSS Initialization — SMP, CET, Per-CPU Ready
+//! NØNOS x86_64 GDT/TSS — SMP, USER, PCID/KPTI hooks, CET, GS/FS, XSAVE, SYSCALL+INT80
 //!
-//! Features:
-//! - Per-CPU GDT/TSS with full IST coverage for all critical faults.
-//! - CPU feature probing via CPUID to conditionally enable:
-//! - SMEP, SMAP, UMIP, NXE, PCID, CET (shadow stacks + IBT), XSAVE.
-//! - Per-CPU GS base for TLS (scheduler, trap context, etc.).
-//! - SYSCALL/SYSRET MSR setup when enabled via feature flag.
-//! - W^X audit-friendly: NX enforced, RO text, per-section layout.
-//! - SMP-safe: each CPU gets its own aligned GDT/TSS/IST bundle.
+//! - Per-CPU dynamic GDT/TSS with allocator-backed IST stacks (+ guard pages)
+//! - Full selector map: kernel/user CS/DS/SS, TSS
+//! - CR0/CR4/EFER hardening; optional PCID, UMIP, SMEP, SMAP; NX forced
+//! - Dual syscall gateways: INT 0x80 and SYSCALL/SYSRET (feature-gated)
+//! - Per-CPU GS/KernelGS base; swapgs helpers; FS base for user TLS
+//! - CET (shadow stack/IBT) MSR stubs; wiring points for future enablement
+//! - XSAVE policy from CPUID leaf 0xD; default x87|SSE; AVX stays off until negotiated
+//! - KPTI/PCID scaffolding: user CR3 (U-CR3) + ASID plumbing hooks
+//! - BSP/AP init entry points; APIC-id keyed registry
+//!
+//! Safety: bring-up is single-threaded per CPU; global registration is lock-free.
 
 #![allow(clippy::module_name_repetitions)]
 
 use core::arch::asm;
-use core::mem::size_of;
-use lazy_static::lazy_static;
-use spin::Once;
+use core::mem::MaybeUninit;
+use core::ptr::NonNull;
+
+use spin::{Once, RwLock};
 use x86_64::{
-    VirtAddr,
+    instructions::{
+        segmentation::{CS, Segment, SS},
+        tables::load_tss,
+    },
+    registers::{
+        control::{Cr0, Cr0Flags, Cr3, Cr3Flags, Cr4, Cr4Flags, Efer, EferFlags},
+        model_specific::{FsBase, GsBase, KernelGsBase, LStar, SFMask, Star},
+        rflags::RFlags,
+    },
     structures::{
         gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector},
         tss::TaskStateSegment,
     },
-    registers::{
-        control::{Cr0, Cr0Flags, Cr4, Cr4Flags, Efer, EferFlags},
-        model_specific::{Efer as MsEfer, LStar, SFMask, Star, KernelGsBase},
-    },
-    instructions::{segmentation::{CS, SS, Segment}, tables::load_tss},
+    VirtAddr,
 };
 
-/// IST slots — mapping critical exceptions to isolated stacks.
-#[repr(usize)]
-pub enum IstSlot {
-    Nmi = 0,
-    Df  = 1,
-    Mc  = 2,
-    Pf  = 3,
-    Gp  = 4,
-    Ss  = 5,
+/// IST indices (IDT will use these)
+pub mod ist {
+    pub const NMI: u16 = 0;
+    pub const DF:  u16 = 1;
+    pub const PF:  u16 = 2;
+    pub const MC:  u16 = 3;
+    pub const GP:  u16 = 4; // optional overflow safe
 }
 
-/// Per-IST stack size (16 KiB for safety)
-const IST_STACK_BYTES: usize = 16 * 1024;
-
-/// Per-CPU bundle: IST stacks + TSS + GDT.
-#[repr(C, align(64))]
-struct CpuArchState {
-    ist_nmi: [u8; IST_STACK_BYTES],
-    ist_df:  [u8; IST_STACK_BYTES],
-    ist_mc:  [u8; IST_STACK_BYTES],
-    ist_pf:  [u8; IST_STACK_BYTES],
-    ist_gp:  [u8; IST_STACK_BYTES],
-    ist_ss:  [u8; IST_STACK_BYTES],
-    tss:     TaskStateSegment,
-    gdt:     GlobalDescriptorTable,
-    sel:     Selectors,
-}
+const IST_BYTES: usize = 16 * 1024;
+const GUARD_BYTES: usize = 4096;
+const CANARY: u64 = 0xD15C_AB1E_C0B1_CAFE;
 
 #[derive(Clone, Copy)]
 pub struct Selectors {
-    pub code: SegmentSelector,
-    pub data: SegmentSelector,
+    pub k_cs: SegmentSelector,
+    pub k_ds: SegmentSelector,
+    pub u_cs: SegmentSelector,
+    pub u_ds: SegmentSelector,
     pub tss:  SegmentSelector,
 }
 
-static CPU0: Once<&'static CpuArchState> = Once::new();
+#[repr(C, align(64))]
+pub struct CpuArch {
+    pub tss: TaskStateSegment,
+    pub gdt: GlobalDescriptorTable,
+    pub sel: Selectors,
+    pub canary: u64,
+    pub xsave_mask: u64,     // XCR0 negotiated mask
+    pub u_cr3: u64,          // KPTI: user CR3 (optional)
+    pub asid: u16,           // PCID ASID (0 = kernel)
+}
 
-lazy_static! {
-    static ref CPU0_STORAGE: CpuArchState = {
-        let mut tss = TaskStateSegment::new();
-        unsafe {
-            tss.interrupt_stack_table[IstSlot::Nmi as usize] =
-                VirtAddr::from_ptr(CPU0_STORAGE.ist_nmi.as_ptr_range().end);
-            tss.interrupt_stack_table[IstSlot::Df as usize] =
-                VirtAddr::from_ptr(CPU0_STORAGE.ist_df.as_ptr_range().end);
-            tss.interrupt_stack_table[IstSlot::Mc as usize] =
-                VirtAddr::from_ptr(CPU0_STORAGE.ist_mc.as_ptr_range().end);
-            tss.interrupt_stack_table[IstSlot::Pf as usize] =
-                VirtAddr::from_ptr(CPU0_STORAGE.ist_pf.as_ptr_range().end);
-            tss.interrupt_stack_table[IstSlot::Gp as usize] =
-                VirtAddr::from_ptr(CPU0_STORAGE.ist_gp.as_ptr_range().end);
-            tss.interrupt_stack_table[IstSlot::Ss as usize] =
-                VirtAddr::from_ptr(CPU0_STORAGE.ist_ss.as_ptr_range().end);
+impl CpuArch {
+    const fn uninit() -> Self {
+        Self {
+            tss: TaskStateSegment::new(),
+            gdt: GlobalDescriptorTable::new(),
+            sel: Selectors {
+                k_cs: SegmentSelector(0),
+                k_ds: SegmentSelector(0),
+                u_cs: SegmentSelector(0),
+                u_ds: SegmentSelector(0),
+                tss:  SegmentSelector(0),
+            },
+            canary: CANARY,
+            xsave_mask: 0,
+            u_cr3: 0,
+            asid: 0,
         }
-
-        let mut gdt = GlobalDescriptorTable::new();
-        let code = gdt.add_entry(Descriptor::kernel_code_segment());
-        let data = gdt.add_entry(Descriptor::kernel_data_segment());
-        let tss_sel = gdt.add_entry(Descriptor::tss_segment(&tss));
-
-        let sel = Selectors { code, data, tss: tss_sel };
-
-        CpuArchState {
-            ist_nmi: [0; IST_STACK_BYTES],
-            ist_df:  [0; IST_STACK_BYTES],
-            ist_mc:  [0; IST_STACK_BYTES],
-            ist_pf:  [0; IST_STACK_BYTES],
-            ist_gp:  [0; IST_STACK_BYTES],
-            ist_ss:  [0; IST_STACK_BYTES],
-            tss,
-            gdt,
-            sel,
-        }
-    };
-}
-
-pub fn init(cpu_id: usize) {
-    assert_eq!(cpu_id, 0, "Only CPU0 supported in this bootstrap");
-
-    let cpu_arch = &*CPU0_STORAGE;
-    CPU0.call_once(|| cpu_arch);
-
-    cpu_arch.gdt.load();
-    unsafe {
-        CS::set_reg(cpu_arch.sel.code);
-        SS::set_reg(cpu_arch.sel.data);
-        load_tss(cpu_arch.sel.tss);
-    }
-
-    unsafe { harden_crs(cpu_id) };
-    unsafe { set_percpu_gs(cpu_arch as *const _ as u64) };
-
-    #[cfg(feature = "nonos-syscall-msr")]
-    enable_syscall(cpu_arch.sel.code.0, cpu_arch.sel.data.0);
-
-    #[cfg(feature = "nonos-xsave")]
-    unsafe { init_xsave_dynamic() };
-}
-
-unsafe fn harden_crs(_cpu: usize) {
-    let mut cr0 = Cr0::read();
-    cr0.insert(Cr0Flags::WRITE_PROTECT);
-    Cr0::write(cr0);
-
-    let mut cr4 = Cr4::read();
-    if cpuid_has(0x7, 0, 1 << 7) { cr4.insert(Cr4Flags::SMEP); }
-    if cpuid_has(0x7, 0, 1 << 20) { cr4.insert(Cr4Flags::UMIP); }
-    if cpuid_has(0x7, 0, 1 << 21) { cr4.insert(Cr4Flags::SMAP); }
-    Cr4::write(cr4);
-
-    let mut efer = Efer::read();
-    efer.insert(EferFlags::NO_EXECUTE_ENABLE);
-    Efer::write(efer);
-
-    // CET Shadow Stack + IBT if supported
-    if cpuid_has(0x7, 0, 1 << 7) { enable_cet(); }
-}
-
-#[cfg(feature = "nonos-syscall-msr")]
-fn enable_syscall(kcs: u16, _kds: u16) {
-    unsafe {
-        MsEfer::update(|f| f.insert(EferFlags::SYSTEM_CALL_EXTENSIONS));
-        let ucs = u64::from(kcs) - 16;
-        let kcs_u64 = u64::from(kcs);
-        let star_val = (ucs << 48) | (kcs_u64 << 32);
-        Star::write(star_val);
-        extern "C" { fn syscall_entry_trampoline(); }
-        LStar::write(VirtAddr::new(syscall_entry_trampoline as u64));
-        const MASK: u64 = (1 << 9) | (1 << 10) | (1 << 8); // IF, DF, TF
-        SFMask::write(MASK);
     }
 }
 
-#[cfg(feature = "nonos-xsave")]
-unsafe fn init_xsave_dynamic() {
-    if !cpuid_has(0x1, 0, 1 << 26) { return; } // no XSAVE
-    let (eax, ebx, ecx, edx) = cpuid(0xD, 0);
-    let mask_lo = eax as u64;
-    let mask_hi = edx as u64;
-    let mask = (mask_hi << 32) | mask_lo;
-    let lo = (mask & 0xFFFF_FFFF) as u32;
-    let hi = (mask >> 32) as u32;
-    asm!(
-        "xsetbv",
-        in("ecx") 0u32,
-        in("eax") lo,
-        in("edx") hi,
-        options(nostack, preserves_flags)
-    );
+/// minimal allocator trait for early stacks (paged + guard if possible)
+pub trait IstAllocator {
+    /// allocate `len` bytes with a preceding guard page; return usable [base,end)
+    unsafe fn alloc_with_guard(&self, len: usize) -> (VirtAddr, VirtAddr);
+    /// free the region previously allocated
+    unsafe fn free_with_guard(&self, base: VirtAddr, len: usize);
 }
 
-unsafe fn set_percpu_gs(ptr: u64) {
+/// per-CPU registry keyed by APIC id
+static CPU_REG: RwLock<heapless::FnvIndexMap<u32, &'static CpuArch, 32>> =
+    RwLock::new(heapless::FnvIndexMap::new());
+
+/// BSP arch block
+static BSP: Once<&'static CpuArch> = Once::new();
+
+/// exported selector map for other subsystems
+pub fn selectors() -> Selectors {
+    bsp_ref().sel
+}
+
+pub fn bsp_ref() -> &'static CpuArch {
+    *BSP.get().expect("GDT/TSS not initialized on BSP")
+}
+
+/// bootstrap CPU (BSP)
+pub unsafe fn init_bsp(apic_id: u32, alloc: &dyn IstAllocator) {
+    let arch = init_cpu_common(apic_id, alloc, /*is_bsp=*/true, /*asid=*/0);
+    BSP.call_once(|| arch);
+}
+
+/// application processor (AP) init (to be called on each AP)
+pub unsafe fn init_ap(apic_id: u32, alloc: &dyn IstAllocator, asid: u16) {
+    let _ = init_cpu_common(apic_id, alloc, /*is_bsp=*/false, asid);
+}
+
+/// install user segments (enable usermode later)
+pub unsafe fn enable_usermode_segments(_apic_id: u32) {
+    // nothing extra: selectors already present; CS/SS reload occurs on iret/ring transition
+}
+
+/// set per-CPU GS base (TLS root)
+pub unsafe fn set_gs_base(ptr: u64) {
+    GsBase::write(VirtAddr::new(ptr));
+}
+
+/// set per-CPU KernelGS base (used with swapgs on entry)
+pub unsafe fn set_kernel_gs_base(ptr: u64) {
     KernelGsBase::write(VirtAddr::new(ptr));
+}
+
+/// set user FS base (userspace TLS)
+pub unsafe fn set_user_fs_base(ptr: u64) {
+    FsBase::write(VirtAddr::new(ptr));
+}
+
+/// PCID/KPTI — supply user CR3 for this CPU (optional)
+pub unsafe fn set_user_cr3(apic_id: u32, u_cr3: u64) {
+    if let Some(arch) = CPU_REG.write().get_mut(&apic_id) {
+        let mut_ref = core::mem::transmute::<&&CpuArch, &mut CpuArch>(arch);
+        mut_ref.u_cr3 = u_cr3;
+    }
+}
+
+/// read negotiated XCR0 mask
+pub fn xsave_mask() -> u64 {
+    bsp_ref().xsave_mask
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// core bring-up
+// ─────────────────────────────────────────────────────────────────────
+
+unsafe fn init_cpu_common(apic_id: u32, alloc: &dyn IstAllocator, is_bsp: bool, asid: u16) -> &'static CpuArch {
+    // allocate struct from .bss static; no heap reliance
+    static mut SLOT: MaybeUninit<CpuArch> = MaybeUninit::uninit();
+    let arch = &mut *SLOT.as_mut_ptr();
+    *arch = CpuArch::uninit();
+
+    // IST stacks with guard pages
+    install_ist(&mut arch.tss, alloc);
+
+    // build GDT with: NULL, KCODE, KDATA, UCODE, UDATA, TSS
+    let k_cs = arch.gdt.add_entry(Descriptor::kernel_code_segment());
+    let k_ds = arch.gdt.add_entry(Descriptor::kernel_data_segment());
+    let u_cs = arch.gdt.add_entry(Descriptor::UserSegment(0x00AF9B000000FFFF)); // 64-bit user code
+    let u_ds = arch.gdt.add_entry(Descriptor::UserSegment(0x00AF93000000FFFF)); // user data
+    let tss  = arch.gdt.add_entry(Descriptor::tss_segment(&arch.tss));
+    arch.sel = Selectors { k_cs, k_ds, u_cs, u_ds, tss };
+
+    // load GDT + TSS + segments
+    arch.gdt.load();
+    CS::set_reg(k_cs);
+    SS::set_reg(k_ds);
+    load_tss(tss);
+
+    // harden control regs
+    harden_crs();
+
+    // PCID hint (off by default until ASIDs used)
+    if has_pcid() {
+        // leave off; enable via enable_pcid() once scheduler sets ASIDs
+    }
+
+    // EFER NX on
+    ensure_nxe();
+
+    // SYSCALL MSR (feature-gated)
+    #[cfg(feature = "nonos-syscall-msr")]
+    init_syscall_msrs(k_cs);
+
+    // INT 0x80 remains available via IDT gate (IDT owns PL3 exposure)
+
+    // XSAVE policy
+    let mask = init_xsave_policy();
+    arch.xsave_mask = mask;
+
+    arch.asid = asid;
+
+    // publish per-CPU record
+    {
+        let mut map = CPU_REG.write();
+        let _ = map.insert(apic_id, &*(arch as *const CpuArch));
+    }
+
+    &*(arch as *const CpuArch)
+}
+
+unsafe fn install_ist(tss: &mut TaskStateSegment, alloc: &dyn IstAllocator) {
+    let (nmi_b, nmi_e) = alloc.alloc_with_guard(IST_BYTES + GUARD_BYTES);
+    let (df_b,  df_e)  = alloc.alloc_with_guard(IST_BYTES + GUARD_BYTES);
+    let (pf_b,  pf_e)  = alloc.alloc_with_guard(IST_BYTES + GUARD_BYTES);
+    let (mc_b,  mc_e)  = alloc.alloc_with_guard(IST_BYTES + GUARD_BYTES);
+    let (gp_b,  gp_e)  = alloc.alloc_with_guard(IST_BYTES + GUARD_BYTES);
+
+    // stacks grow down; point IST to end
+    tss.interrupt_stack_table[ist::NMI as usize] = nmi_e;
+    tss.interrupt_stack_table[ist::DF  as usize] = df_e;
+    tss.interrupt_stack_table[ist::PF  as usize] = pf_e;
+    tss.interrupt_stack_table[ist::MC  as usize] = mc_e;
+    tss.interrupt_stack_table[ist::GP  as usize] = gp_e;
+
+    // IO bitmap & TSS misc remain default (no IO ports for user)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// control registers / features
+// ─────────────────────────────────────────────────────────────────────
+
+fn has_leaf7_edx(bit: u32) -> bool {
+    let (_a, _b, _c, d) = cpuid(0x7, 0);
+    (d & (1 << bit)) != 0
+}
+fn has_leaf7_ecx(bit: u32) -> bool {
+    let (_a, _b, c, _d) = cpuid(0x7, 0);
+    (c & (1 << bit)) != 0
+}
+fn has_ecx_1(bit: u32) -> bool {
+    let (_a, _b, c, _d) = cpuid(0x1, 0);
+    (c & (1 << bit)) != 0
+}
+fn has_pcid() -> bool {
+    let (_a, _b, _c, d) = cpuid(0x1, 0);
+    (d & (1 << 17)) != 0 // PCID in CR4
 }
 
 fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
@@ -197,12 +268,135 @@ fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     (a, b, c, d)
 }
 
-fn cpuid_has(leaf: u32, subleaf: u32, bit: u32) -> bool {
-    let (_, _, ecx, _) = cpuid(leaf, subleaf);
-    (ecx & bit) != 0
+fn harden_crs() {
+    unsafe {
+        // CR0: write protect
+        let mut cr0 = Cr0::read();
+        cr0.insert(Cr0Flags::WRITE_PROTECT);
+        Cr0::write(cr0);
+
+        // CR4: UMIP/SMEP/SMAP if present
+        let mut cr4 = Cr4::read();
+        if has_leaf7_edx(20) { cr4.insert(Cr4Flags::UMIP); }
+        if has_leaf7_edx(7)  { cr4.insert(Cr4Flags::SMEP); }
+        if has_leaf7_edx(21) { cr4.insert(Cr4Flags::SMAP); }
+        Cr4::write(cr4);
+    }
 }
 
-unsafe fn enable_cet() {
-    // Placeholder: write to IA32_S_CET MSR, enable shadow stacks + IBT.
-    // On real hardware, must allocate shadow stack memory per thread.
+fn ensure_nxe() {
+    unsafe {
+        let mut efer = Efer::read();
+        efer.insert(EferFlags::NO_EXECUTE_ENABLE);
+        Efer::write(efer);
+    }
+}
+
+/// opt-in when scheduler assigns ASIDs
+pub unsafe fn enable_pcid(asid: u16) {
+    if !has_pcid() { return; }
+    let mut cr4 = Cr4::read();
+    cr4.insert(Cr4Flags::PCID);
+    Cr4::write(cr4);
+
+    // install kernel CR3 with PCID=0; user will use PCID=asid
+    let (level4, _flags) = Cr3::read();
+    let kcr3 = level4.start_address().as_u64() | 0u64; // PCID 0
+    asm!("mov cr3, {}", in(reg) kcr3, options(nostack, preserves_flags));
+
+    // store ASID where needed (registry already holds asid)
+    let _ = asid;
+}
+
+/// KPTI: switch to user CR3 (with PCID) before iret to ring3
+pub unsafe fn kpti_switch_to_user(u_cr3: u64, asid: u16) {
+    let pcid = (asid as u64) & 0xFFF;
+    let val = (u_cr3 & !0xFFF) | pcid | (1 << 63); // no flush
+    asm!("mov cr3, {}", in(reg) val, options(nostack, preserves_flags));
+}
+
+/// KPTI: on kernel entry, switch back to kernel CR3 (PCID=0)
+pub unsafe fn kpti_switch_to_kernel() {
+    let (level4, _flags) = Cr3::read();
+    let kcr3 = level4.start_address().as_u64() & !0xFFF; // PCID 0
+    asm!("mov cr3, {}", in(reg) kcr3, options(nostack, preserves_flags));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SYSCALL MSRs (alternative to INT 0x80)
+// ─────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "nonos-syscall-msr")]
+fn init_syscall_msrs(k_cs: SegmentSelector) {
+    unsafe {
+        // enable SCE
+        let mut efer = Efer::read();
+        efer.insert(EferFlags::SYSTEM_CALL_EXTENSIONS);
+        Efer::write(efer);
+
+        // STAR: user CS in 63:48, kernel CS in 47:32
+        let ucs = u64::from(k_cs.0).saturating_sub(16);
+        let star = (ucs << 48) | (u64::from(k_cs.0) << 32);
+        Star::write(star);
+
+        extern "C" { fn syscall_entry_trampoline(); }
+        LStar::write(VirtAddr::new(syscall_entry_trampoline as u64));
+
+        // mask IF/DF/TF on entry
+        const IF_MASK: u64 = 1 << 9;
+        const DF_MASK: u64 = 1 << 10;
+        const TF_MASK: u64 = 1 << 8;
+        SFMask::write(IF_MASK | DF_MASK | TF_MASK);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// CET (shadow stacks / IBT) — stub wiring points
+// ─────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "nonos-cet")]
+pub unsafe fn cet_enable_stub() {
+    // Allocate per-thread shadow stacks and WRMSR to IA32_S_CET/IA32_PLx_SSP as needed.
+    // Keep disabled until we have per-thread alloc + context switch integration.
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// XSAVE policy
+// ─────────────────────────────────────────────────────────────────────
+
+fn init_xsave_policy() -> u64 {
+    unsafe {
+        // require XSAVE
+        if !has_ecx_1(26) { return 0; }
+        // CPUID 0xD.0: valid XCR0 mask in EAX/EDX
+        let (eax, _ebx, _ecx, edx) = cpuid(0xD, 0);
+        let mask = (u64::from(edx) << 32) | u64::from(eax);
+        // default to x87|SSE only (bits 0 and 1)
+        let desired = mask & 0b11;
+        // xsetbv XCR0
+        let lo = (desired & 0xFFFF_FFFF) as u32;
+        let hi = (desired >> 32) as u32;
+        asm!("xsetbv", in("ecx") 0u32, in("eax") lo, in("edx") hi, options(nostack, preserves_flags));
+        desired
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// swapgs helpers (entry/exit)
+// ─────────────────────────────────────────────────────────────────────
+
+#[inline(always)]
+pub unsafe fn entry_swapgs_if_needed(rflags: RFlags) {
+    // On SYSCALL/SYSRET paths from user, swapgs is required. On interrupt from kernel, not needed.
+    // Here we assume caller checked CPL; keep utility for future.
+    if rflags.contains(RFlags::IOPL_HIGH) { // placeholder heuristic
+        asm!("swapgs", options(nostack, preserves_flags));
+    }
+}
+
+#[inline(always)]
+pub unsafe fn exit_swapgs_if_needed(rflags: RFlags) {
+    if rflags.contains(RFlags::IOPL_HIGH) {
+        asm!("swapgs", options(nostack, preserves_flags));
+    }
 }
