@@ -4,24 +4,49 @@
   "arch": "x86_64",
   "vendor": "nonos",
   "os": "none",
+  "env": "",
+  "target-endian": "little",
+  "target-pointer-width": "64",
+  "target-c-int-width": "32",
   "cpu": "x86-64",
-  "features": "+sse2,+fxsr,+xsave,+xsaveopt,+xsavec,+xgetbv1,+rdtscp,+clflushopt,+pku,+soft-float",
+  "features": "+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+fxsr,+xsave,+xsaveopt,+xsavec,+xgetbv1,+rdtscp,+clflush,+clflushopt,+popcnt,+pku,+cx8,+cmov",
   "panic-strategy": "abort",
   "executables": true,
-  "linker-flavor": "ld.lld",
-  "linker": "rust-lld",
   "relocation-model": "static",
   "code-model": "kernel",
   "disable-redzone": true,
   "eliminate-frame-pointer": false,
+  "position-independent-executables": false,
+  "static-position-independent-executables": false,
+  "dynamic-linking": false,
+  "has-rpath": false,
   "default-hidden-visibility": true,
-  "tls-model": "local-exec",
+  "has-elf-tls": false,
+  "crt-static-default": true,
+  "crt-static-respected": true,
+  "max-atomic-width": 64,
+  "atomic-cas": true,
+  "trap-unreachable": true,
+  "stack-probes": true,
+  "forces-embed-bitcode": true,
+  "allows-weak-linkage": true,
+  "linker-flavor": "ld.lld",
+  "linker": "rust-lld",
+  "linker-is-gnu": true,
   "pre-link-args": {
     "ld.lld": [
-      "--build-id=none",
-      "-Ttext=0x100000",
-      "--no-rosegment",
-      "--nmagic"
+      "-nostdlib",
+      "-nostartfiles",
+      "-static",
+      "-z",
+      "relro",
+      "-z",
+      "now"
     ]
-  }
+  },
+  "post-link-args": {
+    "ld.lld": []
+  },
+  "archive-format": "gnu",
+  "emit-debug-gdb-scripts": false
 }
