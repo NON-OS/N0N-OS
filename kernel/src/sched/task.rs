@@ -315,3 +315,8 @@ pub fn get(tid: TaskId) -> Option<&'static Task> {
     let tab = TASKS.lock();
     tab.get(&tid).map(|p| unsafe { &*p.as_ptr() })
 }
+
+pub(crate) fn __nonos_task_table_get_mut(tid: TaskId) -> Option<core::ptr::NonNull<Task>> {
+    let mut tab = TASKS.lock();
+    tab.get(&tid).cloned()
+}
