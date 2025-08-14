@@ -1,95 +1,115 @@
-//! NØNOS Memory Region Descriptors
+//! NØNOS Memory Region Management
 //!
-//! Provides type-safe classification of memory layout zones in the ZeroState runtime:
-//! - Kernel-reserved memory
-//! - Bootloader and metadata areas
-//! - Heap, stack, and frame alloc domains
-//! - Device MMIO zones
-//!
-//! Used for diagnostics, sandbox enforcement, and per-module memory accounting.
+//! Provides memory region allocation and tracking for capsules and kernel subsystems.
 
+use core::ptr::NonNull;
 use x86_64::PhysAddr;
 
-/// Enumerates the type of memory segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegionType {
-    KernelText,
-    KernelData,
-    Bootloader,
-    Stack,
-    Heap,
-    FramePool,
-    ModBinary,
-    MMIO,
-    Reserved,
-}
-
-/// Describes a memory region with type tag and physical bounds.
+/// Memory region descriptor
 #[derive(Debug, Clone, Copy)]
-pub struct MemRegion {
-    pub start: PhysAddr,
-    pub end: PhysAddr,
-    pub region_type: RegionType,
-    pub readonly: bool,
-    pub executable: bool,
+pub struct MemoryRegion {
+    pub base: NonNull<u8>,
+    pub size: usize,
+    pub phys_base: PhysAddr,
+    pub flags: RegionFlags,
 }
 
-impl MemRegion {
-    pub fn contains(&self, addr: PhysAddr) -> bool {
-        addr >= self.start && addr < self.end
+bitflags::bitflags! {
+    pub struct RegionFlags: u32 {
+        const READABLE = 1 << 0;
+        const WRITABLE = 1 << 1;
+        const EXECUTABLE = 1 << 2;
+        const USER = 1 << 3;
+        const ZEROED = 1 << 4;
     }
+}
 
+impl MemoryRegion {
+    pub fn new(base: NonNull<u8>, size: usize, phys: PhysAddr, flags: RegionFlags) -> Self {
+        Self {
+            base,
+            size,
+            phys_base: phys,
+            flags,
+        }
+    }
+    
+    pub fn contains(&self, addr: usize) -> bool {
+        let base = self.base.as_ptr() as usize;
+        addr >= base && addr < base + self.size
+    }
+    
     pub fn size_bytes(&self) -> u64 {
-        self.end.as_u64() - self.start.as_u64()
+        self.size as u64
     }
-}
-
-/// Central catalog of memory region layout (optional: build during ZeroState init)
-static mut REGIONS: [Option<MemRegion>; 32] = [None; 32];
-
-/// Register a new memory region
-pub fn register_region(region: MemRegion) -> Result<(), &'static str> {
-    unsafe {
-        for slot in REGIONS.iter_mut() {
-            if slot.is_none() {
-                *slot = Some(region);
-                return Ok(());
-            }
-        }
-    }
-    Err("Region table full")
-}
-
-/// Query region type by address
-pub fn region_type_of(addr: PhysAddr) -> Option<RegionType> {
-    unsafe {
-        for slot in REGIONS.iter() {
-            if let Some(region) = slot {
-                if region.contains(addr) {
-                    return Some(region.region_type);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Log region map for diagnostics
-pub fn print_region_map() {
-    if let Some(logger) = crate::log::logger::try_get_logger() {
+    
+    pub fn zeroize(&self) {
         unsafe {
-            for slot in REGIONS.iter() {
-                if let Some(r) = slot {
-                    logger.log("[REGION] ");
-                    logger.log(&format!(
-                        "{:?} @ 0x{:x} - 0x{:x} [{}]",
-                        r.region_type,
-                        r.start.as_u64(),
-                        r.end.as_u64(),
-                        r.size_bytes()
-                    ));
-                }
-            }
+            core::ptr::write_bytes(self.base.as_ptr(), 0, self.size);
         }
     }
+}
+
+/// Allocate a memory region for a capsule
+pub fn allocate_region(size: usize) -> Option<MemoryRegion> {
+    use crate::memory::{phys, virt};
+    use x86_64::{VirtAddr, PhysAddr};
+    
+    // Allocate physical frames
+    let pages = (size + 4095) / 4096;
+    let frame = phys::alloc_contig(pages, 1, phys::AllocFlags::ZERO)?;
+    
+    // Map to virtual memory
+    extern "Rust" {
+        fn __nonos_alloc_kvm_va(pages: usize) -> u64;
+    }
+    
+    let va = unsafe { __nonos_alloc_kvm_va(pages) };
+    if va == 0 {
+        phys::free_contig(frame, pages);
+        return None;
+    }
+    
+    // Map pages
+    for i in 0..pages {
+        let page_va = VirtAddr::new(va + (i * 4096) as u64);
+        let page_pa = PhysAddr::new(frame.0 + (i * 4096) as u64);
+        
+        unsafe {
+            virt::map4k_at(
+                page_va,
+                page_pa,
+                virt::VmFlags::RW | virt::VmFlags::NX | virt::VmFlags::GLOBAL
+            ).ok()?;
+        }
+    }
+    
+    let base = NonNull::new(va as *mut u8)?;
+    
+    Some(MemoryRegion::new(
+        base,
+        size,
+        PhysAddr::new(frame.0),
+        RegionFlags::READABLE | RegionFlags::WRITABLE | RegionFlags::ZEROED
+    ))
+}
+
+/// Free a memory region
+pub fn free_region(region: &MemoryRegion) {
+    use crate::memory::{phys, virt};
+    use x86_64::VirtAddr;
+    
+    let pages = (region.size + 4095) / 4096;
+    let va_base = region.base.as_ptr() as u64;
+    
+    // Unmap pages
+    for i in 0..pages {
+        let page_va = VirtAddr::new(va_base + (i * 4096) as u64);
+        unsafe {
+            let _ = virt::unmap4k(page_va);
+        }
+    }
+    
+    // Free physical frames
+    phys::free_contig(phys::Frame(region.phys_base.as_u64()), pages);
 }
