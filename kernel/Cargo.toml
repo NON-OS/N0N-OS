@@ -4,13 +4,20 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 license = "AGPL-3.0"
+author = "eK@nonos-tech.xyz"
 description = "NØNOS ZeroState microkernel — RAM-resident, capability-enforced, signed capsules"
 repository = "https://github.com/NON-OS/N0N-OS"
 # build = "build.rs"              # ← enable when is made available 
 
+[[bin]]
+name = "nonos_kernel"
+path = "src/main.rs"
+
 [lib]
+name = "nonos_kernel_lib"
 path = "src/lib.rs"
-crate-type = ["rlib"]             # freestanding kernel lib
+crate-type = ["staticlib", "rlib"]
+
 
 ######################################################################
 # NONOS FEATURES — surgical switches for hardening & subsystems
