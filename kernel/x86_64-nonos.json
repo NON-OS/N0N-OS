@@ -7,7 +7,7 @@
   "env": "",
   "target-endian": "little",
   "target-pointer-width": "64",
-  "target-c-int-width": "32",
+  "target-c-int-width": 32,
   "cpu": "x86-64",
   "features": "+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+fxsr,+xsave,+xsaveopt,+xsavec,+xgetbv1,+rdtscp,+clflush,+clflushopt,+popcnt,+pku,+cx8,+cmov,+cx16,+lahf-lm",
   "panic-strategy": "abort",
