@@ -1,44 +1,37 @@
 {
   "llvm-target": "x86_64-unknown-none",
-  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128",
+  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
   "arch": "x86_64",
-  "vendor": "nonos",
-  "os": "none",
-  "env": "",
-  "abi": "",
   "target-endian": "little",
   "target-pointer-width": "64",
-  "target-c-int-width": 32,
-
-  "cpu": "x86-64",
-  "features": "+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+fxsr,+xsave,+xsaveopt,+xsavec,+xsaveerr,+x87,+mmx,+cmov,+cx8,+cx16,+popcnt,+clflush,+clflushopt,+rdtscp,+lahf-lm",
-
-  "panic-strategy": "abort",
+  "target-c-int-width": "32",
+  "os": "none",
   "executables": true,
-  "dynamic-linking": false,
-
+  "linker-flavor": "ld.lld",
   "linker": "rust-lld",
-
+  "panic-strategy": "abort",
+  "disable-redzone": true,
+  "features": "-mmx,-sse,+soft-float",
   "pre-link-args": {
     "ld.lld": [
-      "-Tlinker.ld",
-      "-nostdlib",
-      "-nostartfiles",
-      "-static",
-      "-z", "relro",
-      "-z", "now",
-      "-z", "noexecstack",
-      "--gc-sections",
-      "--build-id=none"
+      "--script=linker.ld",
+      "--no-dynamic-linker",
+      "-z", "text",
+      "-z", "norelro",
+      "--no-eh-frame-hdr"
     ]
   },
-
-  "archive-format": "gnu",
-  "emit-debug-gdb-scripts": false,
-
   "relocation-model": "static",
-  "code-model": "kernel",
-  "disable-redzone": true,
+  "position-independent-executables": false,
+  "static-position-independent-executables": false,
+  "exe-suffix": "",
+  "has-rpath": false,
+  "no-default-libraries": true,
+  "default-hidden-visibility": false,
+  "emit-debug-gdb-scripts": false,
+  "requires-uwtable": false,
   "frame-pointer": "always",
-  "function-sections": true
+  "stack-probes": {
+    "kind": "inline"
+  }
 }
