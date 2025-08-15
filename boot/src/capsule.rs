@@ -154,6 +154,122 @@ impl<'a> Capsule<'a> {
             }
         }
     }
+
+    /// Resolve the payload entry point as a pointer inside the payload slice.
+    /// - If ELF64 (LE, x86_64), resolve e_entry → file offset via PT_LOAD mapping.
+    /// - If not ELF, assume flat binary with offset 0.
+    #[inline]
+    pub fn entry_ptr(&self) -> Result<*const u8, &'static str> {
+        let p = self.payload();
+        let off = if is_elf64(p) {
+            parse_elf_entry_offset(p)?
+        } else {
+            0usize
+        };
+        if off >= p.len() {
+            return Err("entry offset out of bounds");
+        }
+        // SAFE: bounds-checked offset into payload slice
+        Ok(unsafe { p.as_ptr().add(off) })
+    }
+} // end impl Capsule<'a>
+
+/* ---------- ELF helpers (bounds-checked, unaligned reads) ---------- */
+
+#[inline]
+fn is_elf64(buf: &[u8]) -> bool {
+    buf.len() >= 0x40
+        && &buf[0..4] == b"\x7FELF"
+        && buf[4] == 2 // 64-bit
+        && buf[5] == 1 // little-endian
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Elf64Ehdr {
+    e_ident: [u8; 16],
+    e_type: u16,
+    e_machine: u16,
+    e_version: u32,
+    e_entry: u64,
+    e_phoff: u64,
+    e_shoff: u64,
+    e_flags: u32,
+    e_ehsize: u16,
+    e_phentsize: u16,
+    e_phnum: u16,
+    e_shentsize: u16,
+    e_shnum: u16,
+    e_shstrndx: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Elf64Phdr {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_paddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
+}
+
+const EM_X86_64: u16 = 62;
+const PT_LOAD: u32 = 1;
+
+/// Return FILE OFFSET of e_entry within the payload using the PT_LOAD that contains it.
+fn parse_elf_entry_offset(buf: &[u8]) -> Result<usize, &'static str> {
+    use core::{mem, ptr};
+    if buf.len() < mem::size_of::<Elf64Ehdr>() {
+        return Err("elf: header too small");
+    }
+    // SAFETY: unaligned read from checked slice
+    let ehdr: Elf64Ehdr = unsafe { ptr::read_unaligned(buf.as_ptr() as *const _) };
+    if ehdr.e_machine != EM_X86_64 {
+        return Err("elf: wrong machine");
+    }
+    if ehdr.e_phentsize as usize != mem::size_of::<Elf64Phdr>() {
+        return Err("elf: bad phentsize");
+    }
+    let phoff = ehdr.e_phoff as usize;
+    let phnum = ehdr.e_phnum as usize;
+    let phentsize = ehdr.e_phentsize as usize;
+    let need = phoff
+        .checked_add(
+            phnum
+                .checked_mul(phentsize)
+                .ok_or("elf: phnum overflow")?,
+        )
+        .ok_or("elf: ph table overflow")?;
+    if need > buf.len() {
+        return Err("elf: ph table oob");
+    }
+    let entry = ehdr.e_entry;
+    for i in 0..phnum {
+        let off = phoff + i * phentsize;
+        // SAFETY: bounds checked above
+        let ph: Elf64Phdr = unsafe { ptr::read_unaligned(buf[off..].as_ptr() as *const _) };
+        if ph.p_type != PT_LOAD {
+            continue;
+        }
+        let vstart = ph.p_vaddr;
+        let vend = ph
+            .p_vaddr
+            .checked_add(ph.p_filesz)
+            .ok_or("elf: filesz overflow")?;
+        if entry >= vstart && entry < vend {
+            let rel = entry.checked_sub(vstart).ok_or("elf: entry underflow")?;
+            let file_off = ph.p_offset.checked_add(rel).ok_or("elf: offset overflow")?;
+            let file_off_usize = usize::try_from(file_off).map_err(|_| "elf: offset too large")?;
+            if file_off_usize >= buf.len() {
+                return Err("elf: entry offset oob");
+            }
+            return Ok(file_off_usize);
+        }
+    }
+    Err("elf: entry not in any PT_LOAD")
 }
 
 /* ---------- internal helpers (pure, testable) ---------- */
