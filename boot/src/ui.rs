@@ -1,96 +1,182 @@
-//! NØNOS Boot UI Module - Advanced Terminal UX Framework for ZeroState Boot
+//! ui.rs — NØNOS Boot UI (safe console, sections, progress, spinner)
+//! eK@nonos-tech.xyz
 //!
-//! This interface defines early-stage terminal visuals rendered via UEFI.
-//! It provides highly structured, capability-aware diagnostics during the
-//! ZeroState environment spin-up. All output is routed through UEFI TextOutput.
-//!
-//! # Key Features
-//! - Themed boot splash with edition + runtime metadata
-//! - Color-coded log levels (info, warn, fail)
-//! - Fault-detection display for secure capsule boot
-//! - Future: interactive recovery menu, multi-capsule select, touch-ready
-//!
-//! Designed for seamless integration with secure loader + audit trail.
+//! - No globals: pass &SystemTable<Boot> once and hold a &mut TextOutput
+//! - Structured helpers: banner, section, kv, info/warn/ok/fail, panic
+//! - Progress bar + spinner (ASCII-safe for UEFI text mode)
+//! - Color themes w/ automatic reset; errors propagated (no silent drops)
 
+#![allow(dead_code)]
+
+use uefi::prelude::SystemTable;
 use uefi::proto::console::text::{Color, TextOutput};
-use uefi::table::SystemTable;
-use uefi::ResultExt;
+use uefi::Status;
 
-/// Render the top-level ZeroState boot splash
-pub fn draw_boot_banner() {
-    let st = unsafe { SystemTable::load() };
-    let con_out: &mut TextOutput = st.stdout();
+/// Boot UI with a borrowed console handle (no unsafe global loads).
+pub struct Ui<'a> {
+    con: &'a mut TextOutput,
+    theme: Theme,
+}
 
-    let _ = con_out.set_color(Color::LightCyan, Color::Black);
-    let _ = con_out.clear();
+#[derive(Clone, Copy)]
+pub struct Theme {
+    pub bg: Color,
+    pub info: Color,
+    pub ok: Color,
+    pub warn: Color,
+    pub err: Color,
+    pub title: Color,
+    pub text: Color,
+}
 
-    let banner = [
-        "\r\n",
-        "              ╔═════════════════════════════════════════════════════════════╗\r\n",
-        "              ║                 NØNOS OS :: ZERO-STATE LAUNCHPAD            ║\r\n",
-        "              ║           --- Privacy-Native / Identity-Free Kernel ---     ║\r\n",
-        "              ║            Edition :: Dev Alpha — Built for Capability       ║\r\n",
-        "              ║       Runtime :: UEFI Boot + In-Memory Capsule Dispatch      ║\r\n",
-        "              ╚═════════════════════════════════════════════════════════════╝\r\n",
-        "\r\n",
-    ];
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            bg: Color::Black,
+            info: Color::Gray,
+            ok: Color::LightGreen,
+            warn: Color::Yellow,
+            err: Color::LightRed,
+            title: Color::LightCyan,
+            text: Color::White,
+        }
+    }
+}
 
-    for line in banner.iter() {
-        let _ = con_out.output_string(line);
+impl<'a> Ui<'a> {
+    /// Acquire UI from a system table safely.
+    pub fn new(st: &'a SystemTable<uefi::table::Boot>) -> Self {
+        // SAFETY: UEFI gives us a mutable TextOutput via &mut from SystemTable
+        let con = st.stdout();
+        Ui { con, theme: Theme::default() }
     }
 
-    let _ = con_out.set_color(Color::Gray, Color::Black);
-    let _ = con_out.output_string("     [✓] capsule loader staged :: awaiting kernel envelope\r\n");
-    let _ = con_out.set_color(Color::White, Color::Black);
+    /// Replace color theme.
+    pub fn set_theme(&mut self, t: Theme) { self.theme = t; }
+
+    /// Clear screen and draw a banner.
+    pub fn banner(&mut self) -> Result<(), Status> {
+        self.color(self.theme.title, self.theme.bg)?;
+        self.con.clear()?;
+        self.line("")?;
+        self.raw("              ╔═════════════════════════════════════════════════════════════╗")?;
+        self.raw("              ║                 NØNOS :: ZERO-STATE LAUNCHPAD              ║")?;
+        self.raw("              ║         Privacy-Native / Identity-Free / Capsule-First     ║")?;
+        self.raw("              ║        UEFI Boot  →  Verified Capsule  →  Kernel Jump      ║")?;
+        self.raw("              ╚═════════════════════════════════════════════════════════════╝")?;
+        self.line("")?;
+        self.color(self.theme.text, self.theme.bg)
+    }
+
+    /// Start a titled section.
+    pub fn section(&mut self, title: &str) -> Result<(), Status> {
+        self.color(self.theme.title, self.theme.bg)?;
+        self.raw("── ")?;
+        self.raw(title)?;
+        self.raw(" ")?;
+        self.rule(60)?;
+        self.color(self.theme.text, self.theme.bg)
+    }
+
+    /// Key/Value aligned line.
+    pub fn kv(&mut self, key: &str, val: &str) -> Result<(), Status> {
+        self.color(self.theme.info, self.theme.bg)?;
+        self.raw("• ")?;
+        self.raw(key)?;
+        self.raw(": ")?;
+        self.color(self.theme.text, self.theme.bg)?;
+        self.line(val)
+    }
+
+    /// Info / OK / Warn / Fail log lines.
+    pub fn info(&mut self, msg: &str) -> Result<(), Status> {
+        self.level(self.theme.info, "[info] ", msg)
+    }
+    pub fn ok(&mut self, msg: &str) -> Result<(), Status> {
+        self.level(self.theme.ok, "[ ok ] ", msg)
+    }
+    pub fn warn(&mut self, msg: &str) -> Result<(), Status> {
+        self.level(self.theme.warn, "[warn] ", msg)
+    }
+    pub fn fail(&mut self, msg: &str) -> Result<(), Status> {
+        self.level(self.theme.err, "[FAIL] ", msg)
+    }
+
+    /// Panic/fatal block in red.
+    pub fn panic_block(&mut self, msg: &str) -> Result<(), Status> {
+        self.color(self.theme.err, self.theme.bg)?;
+        self.line("")?;
+        self.raw("──────────────────── SYSTEM FAULT DETECTED ────────────────────")?;
+        self.line("")?;
+        self.raw("[!] ")?; self.line(msg)?;
+        self.raw("───────────────────────────────────────────────────────────────")?;
+        self.line("")?;
+        self.color(self.theme.text, self.theme.bg)
+    }
+
+    /// Draw a simple progress bar: current/total (0..total).
+    pub fn progress(&mut self, current: usize, total: usize, label: &str) -> Result<(), Status> {
+        let total = total.max(1);
+        let width = 32usize;
+        let filled = ((current.min(total) * width) / total).min(width);
+        let mut bar = [b' '; 32];
+        for i in 0..filled { bar[i] = b'='; }
+        self.color(self.theme.info, self.theme.bg)?;
+        self.raw("[")?;
+        self.raw(core::str::from_utf8(&bar).unwrap_or("                                "))?;
+        self.raw("] ")?;
+        self.color(self.theme.text, self.theme.bg)?;
+        self.line(label)
+    }
+
+    /// A tiny spinner (ASCII) you can tick in loops.
+    pub fn spinner(&mut self, i: usize, label: &str) -> Result<(), Status> {
+        const FR: &[u8] = b"|/-\\";
+        let ch = FR[i % FR.len()];
+        self.color(self.theme.info, self.theme.bg)?;
+        self.raw("[")?;
+        self.raw_char(ch as char)?;
+        self.raw("] ")?;
+        self.color(self.theme.text, self.theme.bg)?;
+        self.line(label)
+    }
+
+    /* ------------- low-level helpers (color, write, etc.) ------------- */
+
+    #[inline]
+    fn color(&mut self, fg: Color, bg: Color) -> Result<(), Status> {
+        self.con.set_color(fg, bg)
+    }
+
+    #[inline]
+    fn raw(&mut self, s: &str) -> Result<(), Status> {
+        // UEFI TextOutput accepts UCS-2. The `uefi` crate maps &str → UCS-2 internally.
+        self.con.output_string(s)
+    }
+
+    #[inline]
+    fn raw_char(&mut self, c: char) -> Result<(), Status> {
+        let mut buf = [0u8; 4];
+        let s = c.encode_utf8(&mut buf);
+        self.con.output_string(s)
+    }
+
+    #[inline]
+    fn line(&mut self, s: &str) -> Result<(), Status> {
+        self.con.output_string(s)?;
+        self.con.output_string("\r\n")
+    }
+
+    fn level(&mut self, fg: Color, tag: &str, msg: &str) -> Result<(), Status> {
+        self.color(fg, self.theme.bg)?;
+        self.raw(tag)?;
+        self.color(self.theme.text, self.theme.bg)?;
+        self.line(msg)
+    }
+
+    fn rule(&mut self, n: usize) -> Result<(), Status> {
+        const DASH: &str = "─";
+        for _ in 0..n { self.raw(DASH)?; }
+        self.line("")
+    }
 }
-
-/// Display a structured red failure block with reason
-pub fn display_failure(msg: &str) {
-    let st = unsafe { SystemTable::load() };
-    let con_out: &mut TextOutput = st.stdout();
-
-    let _ = con_out.set_color(Color::Red, Color::Black);
-    let _ = con_out.output_string("\r\n──────────────────── SYSTEM FAULT DETECTED ────────────────────\r\n");
-    let _ = con_out.output_string("[!]: ");
-    let _ = con_out.output_string(msg);
-    let _ = con_out.output_string("\r\n────────────────────────────────────────────────────────────────\r\n");
-
-    let _ = con_out.set_color(Color::White, Color::Black);
-}
-
-/// Emit info-level system telemetry in gray
-pub fn log_info(line: &str) {
-    let st = unsafe { SystemTable::load() };
-    let con_out: &mut TextOutput = st.stdout();
-
-    let _ = con_out.set_color(Color::Gray, Color::Black);
-    let _ = con_out.output_string("[info] ");
-    let _ = con_out.output_string(line);
-    let _ = con_out.output_string("\r\n");
-    let _ = con_out.set_color(Color::White, Color::Black);
-}
-
-/// Emit warning messages in yellow
-pub fn log_warn(line: &str) {
-    let st = unsafe { SystemTable::load() };
-    let con_out: &mut TextOutput = st.stdout();
-
-    let _ = con_out.set_color(Color::Yellow, Color::Black);
-    let _ = con_out.output_string("[warn] ");
-    let _ = con_out.output_string(line);
-    let _ = con_out.output_string("\r\n");
-    let _ = con_out.set_color(Color::White, Color::Black);
-}
-
-/// Emit system panic message in red (fallback display)
-pub fn log_panic(msg: &str) {
-    let st = unsafe { SystemTable::load() };
-    let con_out: &mut TextOutput = st.stdout();
-
-    let _ = con_out.set_color(Color::Red, Color::Black);
-    let _ = con_out.output_string("[PANIC] :: ");
-    let _ = con_out.output_string(msg);
-    let _ = con_out.output_string("\r\n");
-    let _ = con_out.set_color(Color::White, Color::Black);
-}
-
